@@ -1,0 +1,2001 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SSO Queue Manager — Emory OIT</title>
+  <!-- React + Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- SheetJS -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <!-- Google Identity Services -->
+  <script src="https://accounts.google.com/gsi/client" async></script>
+  <!-- Mammoth (DOCX reader) -->
+  <script src="https://unpkg.com/mammoth@1.6.0/mammoth.browser.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body { background: #0f1117; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useCallback, useRef } = React;
+
+
+// ── Google Drive Sync (Google Identity Services) ──────────────────────────────
+const GDRIVE_CLIENT_ID = "154702253821-g2undfcl7cq72e3sj8d9r0ikssr4a1q0.apps.googleusercontent.com";
+const GDRIVE_SCOPES    = "https://www.googleapis.com/auth/drive.file";
+const GDRIVE_FILE_NAME = "SSO_Queue_Data.json";
+const GDRIVE_MIME      = "application/json";
+
+// In-memory token (cleared on page close)
+let _gToken = null;
+let _gTokenExpiry = 0;
+
+function gTokenValid() {
+  return _gToken && Date.now() < _gTokenExpiry - 30000;
+}
+
+// GIS loaded via <script> in <head> — poll until ready
+function loadGIS() {
+  return new Promise((resolve) => {
+    if (window.google?.accounts?.oauth2) { resolve(); return; }
+    const iv = setInterval(() => {
+      if (window.google?.accounts?.oauth2) { clearInterval(iv); resolve(); }
+    }, 100);
+    setTimeout(() => { clearInterval(iv); resolve(); }, 10000); // give up after 10s
+  });
+}
+
+// Request token via GIS TokenClient (popup consent flow)
+function gAuthorize() {
+  return new Promise(async (resolve, reject) => {
+    try { await loadGIS(); } catch(e) { reject(new Error("Failed to load Google auth library: " + e.message)); return; }
+    if (!window.google?.accounts?.oauth2) { reject(new Error("Google Identity Services not available")); return; }
+
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (!settled) { settled = true; reject(new Error("Auth timed out — popup may be blocked. Allow popups for claude.ai and try again.")); }
+    }, 60000);
+
+    try {
+      const client = window.google.accounts.oauth2.initTokenClient({
+        client_id: GDRIVE_CLIENT_ID,
+        scope:     GDRIVE_SCOPES,
+        error_callback: (err) => {
+          if (settled) return;
+          settled = true; clearTimeout(timeout);
+          reject(new Error(err?.message || err?.type || "OAuth error — check Google Cloud consent screen setup"));
+        },
+        callback: (resp) => {
+          if (settled) return;
+          settled = true; clearTimeout(timeout);
+          if (resp.error) { reject(new Error(resp.error_description || resp.error)); return; }
+          _gToken = resp.access_token;
+          _gTokenExpiry = Date.now() + (resp.expires_in || 3600) * 1000;
+          resolve(_gToken);
+        },
+      });
+      client.requestAccessToken({ prompt: "select_account" });
+    } catch (e) {
+      if (!settled) { settled = true; clearTimeout(timeout); reject(e); }
+    }
+  });
+}
+
+// Find SSO_Queue_Data.json in Drive
+async function gFindFile(token) {
+  const r = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=name%3D'${GDRIVE_FILE_NAME}'+and+trashed%3Dfalse&fields=files(id,name,modifiedTime)&spaces=drive`,
+    { headers: { Authorization: "Bearer " + token } }
+  );
+  const d = await r.json();
+  return d.files?.[0] || null;
+}
+
+// Load data from Drive
+async function gLoad(token) {
+  const file = await gFindFile(token);
+  if (!file) return null;
+  const r = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`,
+    { headers: { Authorization: "Bearer " + token } }
+  );
+  if (!r.ok) return null;
+  return await r.json();
+}
+
+// Save data to Drive (create or update)
+async function gSave(token, data) {
+  const file   = await gFindFile(token);
+  const body   = JSON.stringify(data);
+  const metaJ  = JSON.stringify({ name: GDRIVE_FILE_NAME, mimeType: GDRIVE_MIME });
+  const blob   = new Blob([
+    "--bound\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + metaJ +
+    "\r\n--bound\r\nContent-Type: " + GDRIVE_MIME + "\r\n\r\n" + body + "\r\n--bound--"
+  ], { type: "multipart/related; boundary=bound" });
+  const url    = file
+    ? `https://www.googleapis.com/upload/drive/v3/files/${file.id}?uploadType=multipart`
+    : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
+  const r = await fetch(url, {
+    method:  file ? "PATCH" : "POST",
+    headers: { Authorization: "Bearer " + token },
+    body:    blob,
+  });
+  if (!r.ok) throw new Error("Drive save failed: " + r.status);
+  return await r.json();
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FORMS_LINK    = "https://emory.service-now.com/sp/en/how-to-request-shibboleth-for-a-web-application?id=kb_article_view&sysparm_article=KB06221";
+const SNOW_BASE     = "https://emory.service-now.com";
+const SR_UNIVERSITY = "https://emory.service-now.com/sp?id=sc_cat_item&sys_id=b47af99493ad1250076cfb4e1dba1094&sysparm_category=545914f91bdac250792dc956624bcb18";
+const SR_HEALTHCARE = "https://emory.service-now.com/sp?id=sc_cat_item&sys_id=dc4b396447c9625003093e14846d436c&sysparm_category=545914f91bdac250792dc956624bcb18";
+
+// sys_id map extracted from ServiceNow SLA report (03/10/2026)
+const SYS_ID = {
+  SCTASK0042265: "3e980d453bd3b290a808d441a3e45a9e",
+  SCTASK0043407: "a5360898332bb2100cab10919e5c7b47",
+  SCTASK0042320: "09fab9853bdb3690a808d441a3e45a89",
+  SCTASK0042335: "b7c6c60d2b977a90a724f518fe91bf61",
+  SCTASK0031784: "0f1977fd3b203250a808d441a3e45a3b",
+  SCTASK0042943: "fdd2d58b331b32900cab10919e5c7bd8",
+  SCTASK0043201: "ad613e2f2b573ed020e2fa34d891bfb2",
+  SCTASK0043076: "de587d1733933e900cab10919e5c7b80",
+  SCTASK0043302: "937673f72b9f7a1420e2fa34d891bfaf",
+  SCTASK0042538: "9926bbd93bdff2d0a808d441a3e45a72",
+  SCTASK0043767: "a3c902a13327fe100cab10919e5c7bcb",
+  SCTASK0033345: "6923a9fe3bb83290a808d441a3e45ab5",
+  SCTASK0040712: "ad2cbff63b327a50a808d441a3e45ac5",
+  SCTASK0039682: "84791d3b2b623e10a724f518fe91bfcd",
+  INC0231198:    "ad2cbff63b327a50a808d441a3e45ac5", // uses sc_task.do
+  INC0239439:    "f83ef3323b727a50a808d441a3e45a4b",
+  INC0140763:    "28b16d2c2ba3aa9020e2fa34d891bf06",
+  INC0179924:    "00ba7f5c3b74f610a808d441a3e45af2",
+  INC0223460:    "b66cd1523b163a90a808d441a3e45af3",
+  INC0239264:    "6475abb63b7a3a50a808d441a3e45af8",
+  // INC0223460 and INC0239264 sys_ids still needed
+};
+
+// Table overrides for tickets that don't follow the default INC=incident / SCTASK=sc_task pattern
+const SNOW_TABLE = {
+  INC0231198: "sc_task.do",
+};
+
+const snowUrl = (number) => {
+  const sysId = SYS_ID[number];
+  const table = SNOW_TABLE[number] || (number.startsWith("INC") ? "incident.do" : "sc_task.do");
+  if (sysId) {
+    return `${SNOW_BASE}/now/nav/ui/classic/params/target/${table}%3Fsys_id%3D${sysId}%26sysparm_stack%3D%26sysparm_view%3D`;
+  }
+  // Fallback: search by number until sys_id is added
+  return `${SNOW_BASE}/now/nav/ui/classic/params/target/${table}%3Fnumber%3D${number}`;
+};
+
+// Maps NetID → name fragments that appear in comment author lines
+const ASSIGNEE_NAMES = {
+  JBURK22: ["Joel Burke", "Joel B"],
+  GHALL4:  ["Gerry Hall", "Gerald Hall"],
+  RATNAFU: ["Robel Atnafu", "Robel A"],
+};
+
+// Returns the name of the last commenter, or "" if no comments
+function lastCommentAuthor(comments) {
+  if (!comments?.trim()) return "";
+  const lines = comments.trim().split("\n").filter(l => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(/^[\d/]+ [\d:]+ - (.+?):/);
+    if (m) return m[1].trim();
+  }
+  return "";
+}
+
+// Returns true if the last comment was NOT made by the assignee
+function needsResponse(ticket) {
+  if (!ticket.comments?.trim()) return false;
+  const author   = lastCommentAuthor(ticket.comments);
+  const aliases  = ASSIGNEE_NAMES[ticket.assignee] || [];
+  return author !== "" && !aliases.some(n => author.toLowerCase().includes(n.toLowerCase()));
+}
+
+
+const RAW_TICKETS = [
+  { number:"SCTASK0042943", ritm:"RITM0042227", type:"Catalog Task", desc:"SSO (Shibboleth) Intake Request - aae-commonbio-qa", assignee:"JBURK22", created:"2026-03-02", updated:"2026-03-06", state:"Pending", reportedBy:"", comments:"03/06 06:52 - Heidi Sarge: Submitted UAT request REQ0043210.\n03/06 06:51 - Heidi Sarge: entityID for DEV is aae-commonbio-dev.emory.edu\n03/05 08:32 - Joel Burke: What was the entityID of the dev instance?" },
+  { number:"SCTASK0042265", ritm:"RITM0041582", type:"Catalog Task", desc:"Shibboleth for MFA for Epic Mobile Applications", assignee:"GHALL4", created:"2026-02-24", updated:"2026-03-09", state:"Pending", reportedBy:"", comments:"03/09 15:43 - Gerry Hall: Can you provide an update? Config on Emory side in place since 25 Feb.\n02/25 07:54 - Gerry Hall: OIDC conf for 3 services provided.\n02/24 11:42 - Joel Burke: Unclear attribute for sub claim — trying PPID first." },
+  { number:"SCTASK0043407", ritm:"RITM0042601", type:"Catalog Task", desc:"SSO (Shibboleth) Intake Request - aae-commonbio-uat", assignee:"JBURK22", created:"2026-03-06", updated:"2026-03-09", state:"Pending", reportedBy:"", comments:"03/09 07:20 - Heidi Sarge: isMemberOf limited to CN=CommonBio_Users. App behind internal subnets on AWS.\n03/06 14:51 - Joel Burke: Related: SCTASK0041040 (dev), SCTASK0042943 (qa).\n03/06 11:46 - Joel Burke: What groups needed in isMemberOf?" },
+  { number:"SCTASK0042320", ritm:"RITM0041636", type:"Catalog Task", desc:"Entra ID integration with Provation Apex", assignee:"JBURK22", created:"2026-02-24", updated:"2026-03-06", state:"Pending", reportedBy:"", comments:"03/06 11:47 - Joel Burke: Hi Scott. Please fill out the forms and attach them to this request.\n03/02 12:24 - Joel Burke: Follow-up on form submission." },
+  { number:"SCTASK0033345", ritm:"RITM0033080", type:"Catalog Task", desc:"Generic Service Request - Recall system", assignee:"JBURK22", created:"2025-10-28", updated:"2026-02-25", state:"Pending", reportedBy:"N567184", comments:"02/25 18:23 - Gerry Hall: Only attributes approved: givenName, sn, mail, serialNumber (PPID)." },
+  { number:"SCTASK0039682", ritm:"RITM0039184", type:"Catalog Task", desc:"SSO for Statista", assignee:"JBURK22", created:"2026-01-26", updated:"2026-03-05", state:"Pending", reportedBy:"LIBAH", comments:"03/05 10:39 - Joel Burke: Access needs to be limited to a certain population.\n03/04 15:25 - Ann Hulton: Statista SAML config has no authorization controls." },
+  { number:"SCTASK0031784", ritm:"RITM0031580", type:"Catalog Task", desc:"Generic Service Request - Ryght.AI", assignee:"RATNAFU", created:"2025-10-13", updated:"2026-02-04", state:"Pending", reportedBy:"CSHAH8", comments:"02/04 10:22 - Robel Atnafu: Still waiting for details from the Ryght team.\n12/08 12:03 - Robel Atnafu: Waiting on vendor." },
+  { number:"SCTASK0043201", ritm:"RITM0042427", type:"Catalog Task", desc:"SAML SSO Integration - Lippincott Anywhere (Wolters Kluwer) + User Provisioning via SFTP", assignee:"RATNAFU", created:"2026-03-04", updated:"2026-03-05", state:"Open", reportedBy:"", comments:"" },
+  { number:"SCTASK0043076", ritm:"RITM0042316", type:"Catalog Task", desc:"Shibboleth SSO on new School of Nursing website", assignee:"RATNAFU", created:"2026-03-03", updated:"2026-03-06", state:"Open", reportedBy:"", comments:"03/06 13:46 - jharris@digitalpulp.com: Thanks for the info. DP call availability provided." },
+  { number:"SCTASK0043302", ritm:"RITM0042526", type:"Catalog Task", desc:"Request for SSO assistance for SPHERE", assignee:"RATNAFU", created:"2026-03-05", updated:"2026-03-05", state:"Open", reportedBy:"", comments:"" },
+  { number:"SCTASK0042538", ritm:"RITM0041834", type:"Catalog Task", desc:"Shibboleth integration request for IIT Protocol Authoring Tool", assignee:"JBURK22", created:"2026-02-25", updated:"2026-02-25", state:"Open", reportedBy:"", comments:"" },
+  { number:"SCTASK0042335", ritm:"RITM0041653", type:"Catalog Task", desc:"SSO for Mintel", assignee:"RATNAFU", created:"2026-02-24", updated:"2026-03-02", state:"Open", reportedBy:"", comments:"03/02 10:58 - Robel Atnafu: Follow up request sent." },
+  { number:"SCTASK0041942", ritm:"RITM0041261", type:"Catalog Task", desc:"SSO Implementation Request for CodaMetrix", assignee:"RATNAFU", created:"2026-02-19", updated:"2026-03-03", state:"Open", reportedBy:"", comments:"03/03 14:38 - Joel Burke: Can release email as primary identifier but email addresses can change." },
+  { number:"SCTASK0040712", ritm:"RITM0040105", type:"Catalog Task", desc:"SSO Intake Request - StarRez", assignee:"RATNAFU", created:"2026-02-05", updated:"2026-03-03", state:"Open", reportedBy:"", comments:"03/03 18:11 - Robel Atnafu: Followed up on available attributes.\n02/17 08:45 - Tito Ortiz: Can I get an update? Anything else needed from me?" },
+  { number:"INC0231198", ritm:"", type:"Incident", desc:"Media Valet Question for SSO set up", assignee:"RATNAFU", created:"2026-01-22", updated:"2026-02-06", state:"In Progress", reportedBy:"HDMILL2", comments:"02/06 10:12 - Robel Atnafu: Instructions sent." },
+  { number:"INC0223460", ritm:"", type:"Incident", desc:"Emory SSO for Vendor's web application - Trakref", assignee:"RATNAFU", created:"2026-01-09", updated:"2026-03-05", state:"In Progress", reportedBy:"DWANG30", comments:"03/05 09:42 - Dalong Wang: Security Review completed. Confidentiality Form attached. REQ0041300." },
+  { number:"INC0239439", ritm:"", type:"Incident", desc:"Need to add LDS/Shibboleth integration to our Assertion Servers", assignee:"RATNAFU", created:"2026-02-05", updated:"2026-02-12", state:"In Progress", reportedBy:"LMSMIT2", comments:"02/12 13:46 - Laura M Smith: OK, I'll follow that process. Can you close this request?" },
+  { number:"INC0140763", ritm:"", type:"Incident", desc:"Adding Shibboleth to dev-sonarqube.app.emory.edu", assignee:"RATNAFU", created:"2025-08-20", updated:"2026-02-04", state:"On Hold", reportedBy:"MJTAYL6", comments:"02/04 10:32 - Matthew Taylor: Mike Davidson from security team said they will move it up soon." },
+  { number:"INC0239264", ritm:"", type:"Incident", desc:"Reuse LDAP groups for RBAC into Juniper Mist wireless infrastructure", assignee:"JBURK22", created:"2026-02-05", updated:"2026-03-02", state:"On Hold", reportedBy:"KCMILL8", comments:"03/02 12:26 - Joel Burke: Please attach the required forms when you get a chance." },
+  { number:"INC0179924", ritm:"", type:"Incident", desc:"Our customer would like to set up SSO with external vendor - International SOS", assignee:"RATNAFU", created:"2025-10-21", updated:"2026-02-05", state:"On Hold", reportedBy:"DSCHUH2", comments:"02/05 16:23 - Joel Burke: Placing on hold. Let me know if user decides not to proceed." },
+];
+
+const WORKFLOW_STEPS = [
+  { id:"forms_exist",       label:"Forms exist?",                       icon:"📋", hint:"Check if Login Request and/or Confidentiality Form are attached." },
+  { id:"login_form",        label:"Login Request Form received",        icon:"📄", hint:"Emory Login Request Form attached to ticket.", dependsOn:"forms_exist" },
+  { id:"conf_form",         label:"Confidentiality Form received",      icon:"🔒", hint:"Emory Confidentiality Form attached to ticket.", dependsOn:"forms_exist" },
+  { id:"security_review",   label:"Security review completed?",         icon:"🛡️", hint:"Has the application undergone a security review?" },
+  { id:"forms_reviewed",    label:"Form review complete",               icon:"🔍", hint:"All questions answered — use Form Analysis tab." },
+  { id:"steward_sent",      label:"Data Steward approval requested",    icon:"📨", hint:"Approval email sent to appropriate data steward(s)." },
+  { id:"steward_approved",  label:"Data Steward approval received",     icon:"✅", hint:"Steward confirmed attribute approval." },
+  { id:"implemented",       label:"SSO implemented",                    icon:"🚀", hint:"Configuration complete and tested." },
+];
+
+const STATE_META = {
+  "Open":        { color:"#0ea5e9", bg:"rgba(14,165,233,0.12)" },
+  "Pending":     { color:"#f59e0b", bg:"rgba(245,158,11,0.12)" },
+  "In Progress": { color:"#10b981", bg:"rgba(16,185,129,0.12)" },
+  "On Hold":     { color:"#8b5cf6", bg:"rgba(139,92,246,0.12)" },
+};
+
+const STORAGE_KEY = "sso_mgr_v5";
+const API_KEY_STORAGE = "sso_mgr_apikey";
+const daysSince = (d) => Math.floor((Date.now() - new Date(d)) / 86400000);
+const loadMeta  = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); } catch { return {}; } };
+const saveMeta  = (m) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(m)); } catch {} };
+const loadApiKey = () => { try { return localStorage.getItem(API_KEY_STORAGE) || ""; } catch { return ""; } };
+const saveApiKey = (k) => { try { localStorage.setItem(API_KEY_STORAGE, k); } catch {} };
+const blankMeta = () => ({ workflow:{}, followUp:"", priority:"Normal", note:"", formAnalysis:null, finalAttributes:"", finalAudience:[], ssoin:{} });
+
+async function readAsBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload  = () => res(r.result.split(",")[1]);
+    r.onerror = rej;
+    r.readAsDataURL(file);
+  });
+}
+
+async function docxToText(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = async (e) => {
+      try {
+        if (typeof mammoth === "undefined") { res(""); return; }
+        const out = await mammoth.extractRawText({ arrayBuffer: e.target.result });
+        res(out.value || "");
+      } catch (err) { rej(err); }
+    };
+    r.onerror = rej;
+    r.readAsArrayBuffer(file);
+  });
+}
+
+async function claudeCall(messages, system, apiKey) {
+  if (!apiKey) throw new Error("NO_API_KEY");
+  const body = { model:"claude-sonnet-4-20250514", max_tokens:2500, messages };
+  if (system) body.system = system;
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST",
+    headers:{"Content-Type":"application/json", "x-api-key": apiKey, "anthropic-version":"2023-06-01", "anthropic-dangerous-direct-browser-access":"true"},
+    body:JSON.stringify(body),
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message || "API error");
+  return d.content?.map(b => b.text || "").join("") || "";
+}
+
+const ANALYSIS_SYSTEM = `You are an SSO/Shibboleth administrator at Emory University OIT Cybersecurity Architecture. You review Login Request Forms. Respond ONLY with valid JSON inside a json code block — no prose outside it.`;
+
+// ── Report generation (Excel via SheetJS) ────────────────────────────────────
+function generateReport(tickets, meta, pctFn) {
+  if (typeof XLSX === "undefined") { alert("SheetJS not loaded yet — try again in a moment."); return; }
+
+  const wb = XLSX.utils.book_new();
+
+  // ── Helper: hex color → ARGB (SheetJS needs ARGB without #) ──
+  const argb = hex => "FF" + hex.replace("#","");
+
+  // ── Column definitions ──
+  const stepCols = WORKFLOW_STEPS.map(s => s.label);
+  const headers  = [
+    "Ticket #", "RITM", "Type", "Description", "Assignee", "State",
+    "Created", "Last Updated", "Days Since Update",
+    ...stepCols,
+    "% Complete", "Needs Response", "Last Commenter",
+    "Follow-up Date", "Follow-up Overdue",
+    "Form Analyzed", "Open Form Issues",
+    "Priority", "Notes"
+  ];
+
+  // ── Build rows ──
+  const dataRows = tickets.map(t => {
+    const m        = meta[t.number] || blankMeta();
+    const wf       = m.workflow || {};
+    const p        = pctFn(t.number);
+    const nr       = needsResponse(t);
+    const lastAuth = lastCommentAuthor(t.comments);
+    const fuOv     = m.followUp && new Date(m.followUp) <= new Date();
+    const formFlags = m.formAnalysis?.flags?.length || 0;
+
+    const stepVals = WORKFLOW_STEPS.map(s => wf[s.id] ? "Yes" : "No");
+
+    return [
+      t.number, t.ritm || "", t.type, t.desc, t.assignee, t.state,
+      t.created, t.updated, daysSince(t.updated),
+      ...stepVals,
+      p + "%", nr ? "Yes" : "No", lastAuth || "",
+      m.followUp || "", fuOv ? "Yes" : "No",
+      m.formAnalysis ? "Yes" : "No", formFlags > 0 ? formFlags + " issue(s)" : "",
+      m.priority || "Normal", m.note?.trim() || ""
+    ];
+  });
+
+  const wsData = [headers, ...dataRows];
+  const ws     = XLSX.utils.aoa_to_sheet(wsData);
+
+  // ── Column widths ──
+  const colWidths = [
+    14, 12, 12, 50, 10, 12, 11, 11, 8,
+    ...WORKFLOW_STEPS.map(() => 14),
+    8, 14, 18, 12, 14, 10, 10, 10, 40
+  ];
+  ws["!cols"] = colWidths.map(w => ({ wch: w }));
+
+  // ── Freeze top row ──
+  ws["!freeze"] = { xSplit: 0, ySplit: 1 };
+
+  // ── Style helpers ──
+  const styleCell = (cellRef, style) => {
+    if (!ws[cellRef]) return;
+    ws[cellRef].s = style;
+  };
+
+  const headerStyle = {
+    font:      { bold: true, color: { rgb: "FFFFFFFF" }, name: "Arial", sz: 10 },
+    fill:      { patternType: "solid", fgColor: { rgb: argb("#1e3a5f") } },
+    alignment: { horizontal: "center", vertical: "center", wrapText: true },
+    border: { bottom: { style: "thin", color: { rgb: "FF60a5fa" } } }
+  };
+
+  // Apply header styles
+  headers.forEach((_, ci) => {
+    const ref = XLSX.utils.encode_cell({ r: 0, c: ci });
+    styleCell(ref, headerStyle);
+  });
+
+  // ── Per-row styling ──
+  const stepStartCol = 9; // index of first workflow step column
+  const stepEndCol   = stepStartCol + WORKFLOW_STEPS.length - 1;
+
+  dataRows.forEach((row, ri) => {
+    const rowIdx  = ri + 1; // 0-indexed, row 0 = header
+    const ticket  = tickets[ri];
+    const m       = meta[ticket.number] || blankMeta();
+    const wf      = m.workflow || {};
+    const nr      = needsResponse(ticket);
+    const fuOv    = m.followUp && new Date(m.followUp) <= new Date();
+    const rowBg   = ri % 2 === 0 ? "FFF0F4FF" : "FFFFFFFF"; // subtle alternating
+
+    headers.forEach((_, ci) => {
+      const ref = XLSX.utils.encode_cell({ r: rowIdx, c: ci });
+      if (!ws[ref]) ws[ref] = { t: "z", v: "" };
+
+      let fill  = { patternType: "solid", fgColor: { rgb: rowBg } };
+      let font  = { name: "Arial", sz: 10, color: { rgb: "FF1e293b" } };
+      let align = { vertical: "center", wrapText: ci === 3 || ci === headers.length - 1 };
+
+      // Workflow step columns — Yes=green, No=red
+      if (ci >= stepStartCol && ci <= stepEndCol) {
+        const val = ws[ref].v;
+        if (val === "Yes") {
+          fill = { patternType: "solid", fgColor: { rgb: "FFd1fae5" } };
+          font = { ...font, color: { rgb: "FF065f46" }, bold: true };
+        } else {
+          fill = { patternType: "solid", fgColor: { rgb: "FFffe4e6" } };
+          font = { ...font, color: { rgb: "FF9f1239" }, bold: true };
+        }
+        align = { ...align, horizontal: "center" };
+      }
+
+      // State column — colour by state
+      if (ci === 5) {
+        const stateColors = {
+          "Open":        { bg: "FFe0f2fe", fg: "FF0369a1" },
+          "Pending":     { bg: "FFfef3c7", fg: "FF92400e" },
+          "In Progress": { bg: "FFd1fae5", fg: "FF065f46" },
+          "On Hold":     { bg: "FFede9fe", fg: "FF4c1d95" },
+        };
+        const sc = stateColors[ws[ref].v] || {};
+        if (sc.bg) fill = { patternType: "solid", fgColor: { rgb: sc.bg } };
+        if (sc.fg) font = { ...font, color: { rgb: sc.fg }, bold: true };
+        align = { ...align, horizontal: "center" };
+      }
+
+      // Needs Response — Yes = amber
+      const nrCol = stepEndCol + 2;
+      if (ci === nrCol && ws[ref].v === "Yes") {
+        fill = { patternType: "solid", fgColor: { rgb: "FFfef3c7" } };
+        font = { ...font, color: { rgb: "FF92400e" }, bold: true };
+        align = { ...align, horizontal: "center" };
+      }
+
+      // Follow-up Overdue — Yes = red
+      const fuCol = stepEndCol + 6;
+      if (ci === fuCol && ws[ref].v === "Yes") {
+        fill = { patternType: "solid", fgColor: { rgb: "FFffe4e6" } };
+        font = { ...font, color: { rgb: "FF9f1239" }, bold: true };
+        align = { ...align, horizontal: "center" };
+      }
+
+      // Days Since Update — red if >7
+      if (ci === 8 && typeof ws[ref].v === "number" && ws[ref].v > 7) {
+        font = { ...font, color: { rgb: "FF9f1239" }, bold: true };
+      }
+
+      ws[ref].s = { fill, font, alignment: align,
+        border: { bottom: { style: "hair", color: { rgb: "FFe2e8f0" } } }
+      };
+    });
+  });
+
+  XLSX.utils.book_append_sheet(wb, ws, "SSO Queue Report");
+
+  // ── Summary sheet ──
+  const summary = [
+    ["SSO Queue Report"],
+    [`Generated: ${new Date().toLocaleString()}`],
+    [`Total Tickets: ${tickets.length}`],
+    [],
+    ["State", "Count"],
+    ...["Open","Pending","In Progress","On Hold"].map(s => [s, tickets.filter(t => t.state===s).length]),
+    [],
+    ["Needs Response", tickets.filter(t => needsResponse(t)).length],
+    ["Follow-ups Overdue", tickets.filter(t => { const m = meta[t.number]||blankMeta(); return m.followUp && new Date(m.followUp)<=new Date(); }).length],
+    ["Forms Analyzed", tickets.filter(t => (meta[t.number]||blankMeta()).formAnalysis).length],
+  ];
+  const wsSummary = XLSX.utils.aoa_to_sheet(summary);
+  wsSummary["!cols"] = [{ wch: 22 }, { wch: 10 }];
+  XLSX.utils.book_append_sheet(wb, wsSummary, "Summary");
+
+  // ── Download ──
+  XLSX.writeFile(wb, `SSO_Queue_Report_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+
+
+// ── Excel diff ───────────────────────────────────────────────────────────────
+function parseXlsxTickets(wb) {
+  // Try to find the right sheet
+  const sheetName = wb.SheetNames[0];
+  const ws = wb.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(ws, { defval:"" });
+  return rows.map(r => {
+    const number = String(r["Number"] || r["number"] || "").trim();
+    return {
+      number,
+      desc:      String(r["Short description"] || r["short description"] || "").trim(),
+      state:     String(r["State"] || r["state"] || "").trim(),
+      assignee:  String(r["Assigned to"] || r["assigned to"] || "").trim(),
+      updated:   String(r["Updated"] || r["updated"] || r["Updated.1"] || "").trim(),
+      comments:  String(r["Comments and Work notes"] || r["Comments and Work notes.1"] || "").trim(),
+    };
+  }).filter(r => r.number);
+}
+
+function App() {
+  const [meta, setMeta] = useState(() => {
+    const saved = loadMeta();
+    const m = {};
+    RAW_TICKETS.forEach(t => { m[t.number] = { ...blankMeta(), ...(saved[t.number] || {}) }; });
+    return m;
+  });
+
+  const [selected,  setSelected]  = useState(null);
+  const [tab,       setTab]       = useState("workflow");
+  const [stateF,    setStateF]    = useState("All");
+  const [assigneeF, setAssigneeF] = useState("All");
+  const [search,    setSearch]    = useState("");
+  const [aiDraft,   setAiDraft]   = useState({ text:"", loading:false, type:"" });
+  const [formBusy,  setFormBusy]  = useState(false);
+  const [formErr,   setFormErr]   = useState("");
+  const [copied,    setCopied]    = useState("");
+  const [staleDays, setStaleDays] = useState("");
+  const [needsRespF, setNeedsRespF] = useState(false);
+  const [diffResult, setDiffResult] = useState(null);
+  const [showReport, setShowReport] = useState(false);
+  const [metaBusy,   setMetaBusy]  = useState(false);
+  // Google Drive sync state
+  const [driveStatus, setDriveStatus] = useState("disconnected"); // disconnected | connecting | syncing | saved | error | no_client
+  const [driveMsg,    setDriveMsg]    = useState("");
+  const [apiKey,      setApiKey]      = useState(() => loadApiKey());
+  const [showApiKey,  setShowApiKey]  = useState(false);
+  const [apiKeyInput, setApiKeyInput] = useState(() => loadApiKey());
+  const saveTimerRef  = useRef(null);
+  const fileRef       = useRef();
+  const metaRef       = useRef();
+  const xlsxRef       = useRef();
+  const importRef     = useRef();
+
+  // ── Drive: connect + initial load ──
+  async function driveConnect() {
+    setDriveStatus("connecting");
+    setDriveMsg("Opening Google sign-in popup…");
+    try {
+      const token = gTokenValid() ? _gToken : await gAuthorize();
+      setDriveStatus("syncing");
+      setDriveMsg("Signed in — loading data from Drive…");
+      const remote = await gLoad(token);
+      if (remote) {
+        setMeta(prev => {
+          const merged = { ...prev };
+          RAW_TICKETS.forEach(t => {
+            if (remote[t.number]) merged[t.number] = { ...blankMeta(), ...remote[t.number] };
+          });
+          saveMeta(merged);
+          return merged;
+        });
+        setDriveMsg("✓ Loaded from Drive · " + new Date().toLocaleTimeString());
+      } else {
+        setDriveMsg("✓ Connected — no saved file yet, will create on first change");
+      }
+      setDriveStatus("saved");
+    } catch (e) {
+      setDriveStatus("error");
+      setDriveMsg(e.message || "Auth failed");
+    }
+  }
+
+  // ── Drive: debounced auto-save whenever meta changes ──
+  useEffect(() => {
+    if (!gTokenValid()) return; // not connected, skip Drive save
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    setDriveStatus("syncing");
+    saveTimerRef.current = setTimeout(async () => {
+      try {
+        await gSave(_gToken, meta);
+        setDriveStatus("saved");
+        setDriveMsg("Saved to Drive · " + new Date().toLocaleTimeString());
+      } catch (e) {
+        setDriveStatus("error");
+        setDriveMsg("Save failed: " + e.message);
+      }
+    }, 2000);
+  }, [meta]);
+
+  // Load SheetJS once
+  useEffect(() => {
+    if (typeof XLSX === "undefined") {
+      const s = document.createElement("script");
+      s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+      document.head.appendChild(s);
+    }
+  }, []);
+
+  const handleXlsxUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const wb       = XLSX.read(ev.target.result, { type:"array" });
+        const incoming = parseXlsxTickets(wb);
+        const existing = RAW_TICKETS.reduce((acc, t) => { acc[t.number] = t; return acc; }, {});
+
+        const updated    = [];
+        const newTickets = [];
+
+        incoming.forEach(inc => {
+          if (existing[inc.number]) {
+            const old = existing[inc.number];
+            const changes = [];
+            if (inc.state    !== old.state)    changes.push(`State: ${old.state} → ${inc.state}`);
+            if (inc.assignee !== old.assignee) changes.push(`Assignee: ${old.assignee} → ${inc.assignee}`);
+            if (inc.updated  !== old.updated)  changes.push(`Updated: ${inc.updated}`);
+            // Check if comments grew
+            const oldLen = (old.comments||"").trim().length;
+            const newLen = (inc.comments||"").trim().length;
+            if (newLen > oldLen) changes.push(`New comments added`);
+            if (changes.length) updated.push({ ...inc, changes });
+          } else {
+            newTickets.push(inc);
+          }
+        });
+
+        setDiffResult({ updated, newTickets, uploadedAt: new Date().toLocaleString(), fileName: file.name });
+      } catch (err) {
+        alert("Could not parse Excel file: " + err.message);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  // ── Import saved progress from JSON (exported from localStorage) ──
+  function handleImportJSON(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const imported = JSON.parse(ev.target.result);
+        // Validate it looks like SSO queue data
+        const keys = Object.keys(imported);
+        const validKeys = keys.filter(k => k.startsWith("SCTASK") || k.startsWith("INC") || k.startsWith("RITM"));
+        if (validKeys.length === 0) {
+          alert("This doesn\'t look like SSO Queue Manager data. Make sure you copied the right localStorage value.");
+          return;
+        }
+        setMeta(prev => {
+          const merged = {};
+          RAW_TICKETS.forEach(t => {
+            merged[t.number] = { ...blankMeta(), ...(prev[t.number] || {}), ...(imported[t.number] || {}) };
+          });
+          saveMeta(merged);
+          return merged;
+        });
+        alert(`✓ Imported progress for ${validKeys.length} tickets! Your data has been restored.`);
+      } catch (err) {
+        alert("Could not parse JSON file: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  useEffect(() => { saveMeta(meta); }, [meta]);
+
+  const patch = useCallback((num, p) =>
+    setMeta(prev => ({ ...prev, [num]: { ...prev[num], ...p } })), []);
+
+  const toggleStep = (num, id) => {
+    const wf = { ...(meta[num]?.workflow || {}) };
+    wf[id] = !wf[id];
+    patch(num, { workflow: wf });
+  };
+
+  const PCT_STEPS = ["forms_exist","login_form","conf_form","security_review","security_review_proof","forms_reviewed","steward_sent","steward_approved","handoff_to_gerry","implemented"];
+  const pct = (num) => {
+    const wf = meta[num]?.workflow || {};
+    return Math.round(PCT_STEPS.filter(s => wf[s]).length / PCT_STEPS.length * 100);
+  };
+
+  const tickets = RAW_TICKETS.map(t => ({ ...t, m: meta[t.number] || blankMeta() }));
+
+  const visible = tickets.filter(t => {
+    if (stateF    !== "All" && t.state    !== stateF)    return false;
+    if (assigneeF !== "All" && t.assignee !== assigneeF) return false;
+    if (search && !t.desc.toLowerCase().includes(search.toLowerCase()) &&
+        !t.number.toLowerCase().includes(search.toLowerCase()))        return false;
+    if (needsRespF && !needsResponse(t))                               return false;
+    if (staleDays !== "" && daysSince(t.updated) < parseInt(staleDays)) return false;
+    return true;
+  });
+
+  const overdue = tickets.filter(t => t.m.followUp && new Date(t.m.followUp) <= new Date()).length;
+  const sel     = selected ? tickets.find(t => t.number === selected.number) : null;
+
+  function buildPrompt(ticket) {
+    return `Analyze this Emory Login Service Request (Web SSO) form for ticket ${ticket.number}: "${ticket.desc}".
+
+The form has these exact labeled fields — extract them precisely:
+- "Emory Contact:" followed by the person's full name on the same line
+- "NetID:" next to the Emory Contact name (first NetID on the form — this is the contact's NetID)
+- "Supervisor's Name:" followed by the supervisor's full name
+- "NetID:" next to the supervisor's name (second NetID on the form — this is the supervisor's NetID)
+- "Vendor or Company hosting application:" 
+- "Vendor/Company ... contact:" followed by the vendor contact name
+- "Email:" for the vendor contact email
+- "Application Name:"
+- "Description of the Application:"
+- "entityID:"
+- "Test URL:"
+- "Internally or externally hosted?"
+- "How will authorization be handled for the application?"
+- "Has the application been through an OIT Security Review?"
+- Audience section: "University Staff?", "University Faculty?", "University Students?", "Emory Healthcare Staff?", "Emory Healthcare Sponsored Account Holders?", "University Sponsored Account Holders?"
+- Attributes section under "List any attribute requests below:"
+
+Return ONLY a JSON object in a \`\`\`json block with this exact shape:
+{
+  "appName": "string — from Application Name field",
+  "appDescription": "string — from Description of the Application field",
+  "audience": ["array — include: University employees (if any University Staff/Faculty/Students = Yes), Healthcare employees (if Emory Healthcare Staff = Yes), University students (if University Students = Yes), EmoryCard (if EmoryCard = Yes)"],
+  "attributes": ["array of attribute names from the Request for Attributes section"],
+  "hasPPID": false,
+  "supportsSAML": "Yes | No | Not specified",
+  "securityReview": "Completed | Not completed | Not specified — from Has the application been through an OIT Security Review field",
+  "accessLimitation": "string — from How will authorization be handled field",
+  "entityId": "string or empty — from entityID field",
+  "testUrl": "string or empty — from Test URL field",
+  "hosting": "string or empty — from Internally or externally hosted field",
+  "flags": ["one string per issue"],
+  "emoryContact": "string — ONLY the person's full name from the Emory Contact field (e.g. 'Dalong Wang')",
+  "emoryContactNetId": "string — the NetID on the same row as the Emory Contact (e.g. 'DWANG30')",
+  "supervisorName": "string — ONLY the supervisor's full name from the Supervisor's Name field (e.g. 'Edgar Sinsuan')",
+  "supervisorNetId": "string — the NetID on the same row as the Supervisor's Name (e.g. 'ESINSUA')",
+  "vendor": "string or empty — from Vendor or Company hosting application field",
+  "vendorContact": "string or empty — from Vendor/Company contact field",
+  "vendorEmail": "string or empty — vendor contact email",
+  "requesterName": "string or empty — same as emoryContact typically",
+  "requesterEmail": "string or empty",
+  "stewardTo": "comma-separated To: names+emails based on audience: University employees=Peter Buch <pbuch@emory.edu>, Healthcare employees=Elizabeth Dangler Wilson <elizabeth.dangler@emoryhealthcare.org>, University students=Kurt Haas <kphaas@emory.edu>, EmoryCard=Kim Pfeffer <kim.pfeffer@emory.edu>",
+  "stewardBody": "full email body to data stewards — describe app and audience, list attributes with plain-English meanings, end with: Do you approve the release of these attributes? Sign off: OIT Cybersecurity Architecture. Start: Hello,",
+  "requesterBody": "full email body to requester listing ONLY issues to resolve. Empty string if no flags. Start: Hello,"
+}
+
+Flag rules:
+- securityReview not Completed: include correct review link — University: ${SR_UNIVERSITY} | Healthcare: ${SR_HEALTHCARE}
+- hasPPID false: flag with exact text: Our preferred identifier is SerialNumber (Public Person ID / PPID). Please confirm whether this identifier will meet your application needs.
+- supportsSAML not Yes: flag that SAML 2.0 support must be confirmed
+- accessLimitation vague or missing: flag that clarification is needed on how access will be limited`;
+  }
+
+  async function handleUpload(e) {
+    const file = e.target.files?.[0];
+    if (!file || !sel) return;
+    e.target.value = "";
+    const isPdf  = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+    const isDocx = file.name.toLowerCase().endsWith(".docx");
+    if (!isPdf && !isDocx) { setFormErr("Please upload a PDF or DOCX file."); return; }
+
+    setFormBusy(true); setFormErr(""); setTab("form");
+
+    try {
+      let messages;
+      if (isPdf) {
+        const b64 = await readAsBase64(file);
+        messages = [{ role:"user", content:[
+          { type:"document", source:{ type:"base64", media_type:"application/pdf", data:b64 } },
+          { type:"text", text: buildPrompt(sel) }
+        ]}];
+      } else {
+        const text = await docxToText(file);
+        if (!text) throw new Error("Could not read DOCX text. Try saving as PDF.");
+        messages = [{ role:"user", content:`Form content:\n\n${text}\n\n${buildPrompt(sel)}` }];
+      }
+
+      const raw = await claudeCall(messages, ANALYSIS_SYSTEM, apiKey);
+      const match = raw.match(/```json\s*([\s\S]*?)```/) || raw.match(/(\{[\s\S]*\})/);
+      if (!match) throw new Error("Could not parse AI response. Please try again.");
+      const analysis = JSON.parse(match[1]);
+      patch(sel.number, { formAnalysis: { ...analysis, fileName: file.name, at: new Date().toISOString() } });
+      // Auto-populate handoff fields from form analysis if not already filled
+      autoPopulateHandoff(sel.number, analysis);
+      setFormBusy(false);
+    } catch (err) {
+      setFormErr(err.message === "NO_API_KEY"
+        ? "No API key set — click the 🔑 Key button in the top bar to add your Anthropic API key."
+        : err.message || "Error analyzing form.");
+      setFormBusy(false);
+    }
+  }
+
+  function autoPopulateHandoff(num, analysis) {
+    const existing = meta[num]?.ssoin || {};
+    const updates = {};
+    if (analysis.appName)             updates.application_name             = analysis.appName;
+    if (analysis.appDescription)      updates.application_description      = analysis.appDescription;
+    if (analysis.supportsSAML==="Yes") updates.authentication_protocol     = "SAML 2.0";
+    if (analysis.hasPPID)             updates.application_primary_identifier = "SerialNumber (PPID)";
+    if (analysis.accessLimitation)    updates.authorization_method         = analysis.accessLimitation;
+    if (analysis.attributes?.length)  updates.attributes_released          = analysis.attributes.join("\n");
+    if (analysis.entityId)            updates.entityid                     = analysis.entityId;
+    if (analysis.testUrl)             updates.test_url                     = analysis.testUrl;
+    if (analysis.hosting)             updates.application_hosting          = analysis.hosting;
+    if (analysis.vendor)              updates.vendor                       = analysis.vendor;
+    if (analysis.vendorContact)       updates.vendor_contact_name          = analysis.vendorContact;
+    if (analysis.vendorEmail)         updates.vendor_contact_email_address = analysis.vendorEmail;
+    // Emory Contact → Business Owner
+    if (analysis.emoryContact)        updates.application_business_owner_name  = analysis.emoryContact;
+    if (analysis.emoryContactNetId)   updates.application_business_owner_netid = analysis.emoryContactNetId;
+    // Supervisor → Technical Owner
+    if (analysis.supervisorName)      updates.application_technical_owner_name  = analysis.supervisorName;
+    if (analysis.supervisorNetId)     updates.application_technical_owner_netid = analysis.supervisorNetId;
+    if (Object.keys(updates).length) {
+      patch(num, { ssoin: { ...existing, ...updates } });
+    }
+  }
+
+  function forcePopulateOwners(num, analysis) {
+    // Always overwrite owner fields from latest form analysis
+    const existing = meta[num]?.ssoin || {};
+    const updates = {};
+    if (analysis.emoryContact)      updates.application_business_owner_name  = analysis.emoryContact;
+    if (analysis.emoryContactNetId) updates.application_business_owner_netid = analysis.emoryContactNetId;
+    if (analysis.supervisorName)    updates.application_technical_owner_name  = analysis.supervisorName;
+    if (analysis.supervisorNetId)   updates.application_technical_owner_netid = analysis.supervisorNetId;
+    if (Object.keys(updates).length) {
+      patch(num, { ssoin: { ...existing, ...updates } });
+    }
+  }
+
+  async function handleMetadataUpload(e) {
+    const file = e.target.files?.[0];
+    if (!file || !sel) return;
+    e.target.value = "";
+    const isXml = file.name.toLowerCase().endsWith(".xml") || file.type === "text/xml" || file.type === "application/xml";
+    if (!isXml) { setFormErr("Please upload an XML metadata file."); return; }
+
+    setMetaBusy(true); setFormErr("");
+    try {
+      const text = await file.text();
+      // Parse key fields from SAML metadata XML
+      const entityIdMatch  = text.match(/entityID="([^"]+)"/);
+      const acsMatch       = text.match(/AssertionConsumerService[^/]*Location="([^"]+)"/);
+      const orgNameMatch   = text.match(/<(?:\w+:)?OrganizationName[^>]*>([^<]+)</);
+      const sloMatch       = text.match(/SingleLogoutService[^/]*Location="([^"]+)"/);
+
+      const ssoin = meta[sel.number]?.ssoin || {};
+      const updates = {};
+      if (entityIdMatch?.[1] && !ssoin.entityid)     updates.entityid    = entityIdMatch[1];
+      if (acsMatch?.[1]      && !ssoin.test_url)     updates.test_url    = acsMatch[1];
+      if (orgNameMatch?.[1]  && !ssoin.application_name) updates.application_name = orgNameMatch[1];
+      if (sloMatch?.[1])                              updates.slo_url     = sloMatch[1];
+      updates.metadata_xml  = text;
+      updates.metadata_file = file.name;
+
+      patch(sel.number, { ssoin: { ...ssoin, ...updates } });
+      setMetaBusy(false);
+    } catch (err) {
+      setFormErr("Could not parse metadata file: " + err.message);
+      setMetaBusy(false);
+    }
+  }
+
+  async function genDraft(type) {
+    if (!sel) return;
+    setAiDraft({ text:"", loading:true, type }); setTab("draft");
+
+    const fa = sel.m.formAnalysis;
+    const finalAttrs    = sel.m.finalAttributes?.trim();
+    const finalAudience = sel.m.finalAudience || [];
+
+    // Build steward To: line from finalAudience or fall back to form analysis
+    const STEWARD_MAP = {
+      "University employees": "Peter Buch <pbuch@emory.edu>",
+      "Healthcare employees": "Elizabeth Dangler Wilson <elizabeth.dangler@emoryhealthcare.org>",
+      "University students":  "Kurt Haas <kphaas@emory.edu>",
+      "EmoryCard":            "Kim Pfeffer <kim.pfeffer@emory.edu>",
+    };
+    const stewardTo = finalAudience.length > 0
+      ? finalAudience.map(a => STEWARD_MAP[a]).filter(Boolean).join(", ")
+      : (fa?.stewardTo || "");
+
+    const appName = fa?.appName || sel.desc;
+    const appDesc = fa?.appDescription || "";
+    const audience = finalAudience.length > 0 ? finalAudience.join(", ") : (fa?.audience?.join(", ") || "");
+    const attrs = finalAttrs || fa?.attributes?.join(", ") || "";
+
+    // Subject line: "Shibboleth Attribute Approval - <App Name>"
+    const subject = `Shibboleth Attribute Approval - ${appName}`;
+
+    const ATTRIBUTE_REFERENCE = `
+Available Emory Shibboleth attributes and their meanings (use ONLY these descriptions when explaining attributes):
+- academicCareer: School a student is enrolled in (College, RSPH, GBS, etc.)
+- academicProgram: Student academic program
+- departmentNumber: HR department code
+- businessCategory: Broad business category/division type
+- cn: Common name / NetID in directory form
+- companyAccount: Company identifier (EUV, EHC, etc.)
+- description: Open-ended field set by person or directory manager
+- displayName: Preferred first name + surname for display
+- eduPersonAffiliation: Person's relationship to institution (student, faculty, staff, etc.) — multivalued
+- eduPersonEntitlement: License, permission, or right to access a resource
+- eduPersonNickname: Preferred first name or preferred first + middle name
+- eduPersonOrgDN: Distinguished name of the institution directory entry
+- eduPersonOrgUnitDN: Distinguished name of person's organizational unit(s) — multivalued
+- eduPersonPrimaryAffiliation: Person's PRIMARY institutional relationship (student, faculty, staff, etc.)
+- eduPersonPrimaryOrgUnitDN: Distinguished name of person's primary organizational unit
+- eduPersonPrincipleName: Scoped NetID in form NetID@emory.edu — for inter-institutional authentication
+- eduPersonScopedAffiliation: Scoped affiliation — multivalued
+- emoryCardNumber: EmoryCard number (primary key in EmoryCard system)
+- emoryGivenName: First name
+- employeeNumber: Employee number
+- employeeType: Employment type (e.g. Full Time)
+- fullName: Full name
+- givenName: First name
+- hremplID: PSHR employee ID
+- isMemberOf / memberOf: Group membership in directory — multivalued
+- mail: Preferred/primary email address
+- mailForwardingAddress: Email forwarding address
+- name: NetID
+- o: Top-level organization name (Emory University)
+- SAemplID: Student number in PeopleSoft Student (PSSA/OPUS)
+- organizationalStatus: Emory person type (staff, student, faculty, retiree, sponsored, etc.) — null for Healthcare
+- ou: Organizational unit (division abbreviation + department name)
+- publishexternal: Y/N — whether person can be published in Online Directory
+- publishinternal: Y/N — whether person can be published in internal directory/GAL
+- postalAddress: Campus or office address
+- serialNumber: Public Person ID (PPID)
+- sn: Surname / family name
+- suppressinfo: Y/N — indicates FERPA or other approved suppression
+- telephoneNumber: Office/campus phone number
+- title: HR job title
+- uid: NetID
+- uidLower: NetID always in lowercase
+- uidNumber: Linux system user number
+- undergrad: Y/N — whether person is an undergraduate
+- year: Numeric class year (freshman, sophomore, junior, senior, etc.)`;
+
+    const prompts = {
+      request_forms: (() => {
+        const wf = sel.m.workflow || {};
+        const missingLogin = !wf.login_form;
+        const missingConf  = !wf.conf_form;
+        const missing = [missingLogin && "Emory Login Request Form", missingConf && "Emory Confidentiality Form"].filter(Boolean).join(" and the ");
+        const both = missingLogin && missingConf;
+        return `Write a professional concise email asking the requester to attach the following missing form(s) to SSO ticket ${sel.number}: ${sel.desc}. Missing: ${missing}. ${both ? "Both forms are required." : "This form is required to proceed."} Forms link: ${FORMS_LINK}. Sign off as OIT Cybersecurity Architecture. Start with Hello, — no subject line.`;
+      })(),
+      status_update: `Write a brief professional status update email for SSO ticket ${sel.number}: ${sel.desc}. State: ${sel.state}. Days since last update: ${daysSince(sel.updated)}. Progress: ${pct(sel.number)}%. Recent activity: ${sel.comments?.slice(0,400)||"None"}. Sign off as OIT Cybersecurity Architecture. Start with Hello, — no subject line.`,
+      close_request: `Write a brief professional closure email confirming SSO integration is complete for ticket ${sel.number}: ${sel.desc}. Invite them to open a new ticket if issues arise. Sign off as OIT Cybersecurity Architecture. Start with Hello, — no subject line.`,
+      steward_approval: `Write a professional email to Emory data stewards requesting approval to release Shibboleth attributes for a new SSO integration.
+
+Application: ${appName}
+Description: ${appDesc || sel.desc}
+Audience: ${audience || "Emory users"}
+Attributes to release: ${attrs || "see form"}
+Ticket: ${sel.number}
+
+${ATTRIBUTE_REFERENCE}
+
+Format requirements:
+- Start with exactly: Hello,
+- One concise paragraph describing the application and its purpose
+- One sentence stating who will use it (the audience)
+- A blank line, then a bullet list of ONLY the requested attributes — each bullet formatted as:
+  attributeName - plain English description (use the reference list above for accurate descriptions)
+- After the list, on its own line: Do you approve the release of these attributes?
+- Sign off as: OIT Cybersecurity Architecture
+- Output the email body ONLY — no subject line in the body text.`,
+      gerry_handoff: (() => {
+        const s = sel.m.ssoin || {};
+        const attrs = s.attributes_released || sel.m.finalAttributes || "";
+        const attrLines = attrs.trim().split("\n").filter(Boolean).map(l => l.trim()).join("\n");
+        const fields = [
+          s.application_name         && `Application: ${s.application_name}`,
+          s.entityid                 && `Entity ID: ${s.entityid}`,
+          s.test_url                 && `Test URL: ${s.test_url}`,
+          s.authentication_protocol  && `Protocol: ${s.authentication_protocol}`,
+          s.application_primary_identifier && `Primary Identifier: ${s.application_primary_identifier}`,
+          s.authorization_method     && `Authorization Method: ${s.authorization_method}`,
+          s.application_hosting      && `Hosting: ${s.application_hosting}`,
+          s.slo_url                  && `Single Logout URL: ${s.slo_url}`,
+          s.vendor                   && `Vendor: ${s.vendor}`,
+          s.vendor_contact_name      && `Vendor Contact: ${s.vendor_contact_name}${s.vendor_contact_email_address ? " <" + s.vendor_contact_email_address + ">" : ""}`,
+          s.metadata_file            && `SAML Metadata: ${s.metadata_file} (attached)`,
+          s.implementation_notes     && `Notes: ${s.implementation_notes}`,
+        ].filter(Boolean).join("\n");
+
+        return `Generate a concise ServiceNow ticket comment from OIT Cybersecurity Architecture to Gerry Hall (GHALL4) handing off an approved SSO request for implementation.
+
+Ticket: ${sel.number} — ${sel.desc}
+
+${fields}
+
+Approved attributes to release:
+${attrLines || "(see attributes above)"}
+
+The message must:
+- State that attributes have been approved and the request is being assigned for implementation
+- List each attribute on its own line as: attributeName - plain English description
+- Be short and professional — no filler sentences
+- Match this exact tone and format:
+"Attributes have been approved. Assigning request for implementation. Attributes to release:
+givenName - legal first name
+sn - last name
+mail - email address"
+- Include any other relevant technical details (entity ID, protocol, auth method, notes) after the attributes list if available
+- Do NOT include a subject line or greeting — this is a ticket comment`;
+      })(),
+    };
+    try {
+      const text = await claudeCall([{ role:"user", content:prompts[type] }], null, apiKey);
+      setAiDraft({ text, loading:false, type, stewardTo: type==="steward_approval" ? stewardTo : "", subject: type==="steward_approval" ? subject : "" });
+    } catch(e) {
+      const msg = e.message === "NO_API_KEY"
+        ? "⚠ No API key set — click the 🔑 Key button in the top bar to add your Anthropic API key."
+        : "Error generating draft: " + e.message;
+      setAiDraft({ text:msg, loading:false, type, stewardTo:"", subject:"" });
+    }
+  }
+
+  function doCopy(text, key) {
+    navigator.clipboard.writeText(text);
+    setCopied(key);
+    setTimeout(() => setCopied(""), 2000);
+  }
+
+  const CopyBtn = ({ text, copyId }) => (
+    <button onClick={() => doCopy(text, copyId)}
+      style={{ padding:"5px 12px", background:copied===copyId?"#10b981":"#1e3a5f", border:`1px solid ${copied===copyId?"#10b981":"#2563eb55"}`, borderRadius:6, color:copied===copyId?"white":"#60a5fa", cursor:"pointer", fontSize:11, whiteSpace:"nowrap", transition:"all .2s" }}>
+      {copied===copyId ? "✓ Copied" : "Copy"}
+    </button>
+  );
+
+  const EmailBlock = ({ label, to, body, copyId }) => {
+    if (!body) return null;
+    return (
+      <div style={{ background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:8, marginBottom:14 }}>
+        <div style={{ padding:"10px 15px", borderBottom:"1px solid #2a2d3e", display:"flex", justifyContent:"space-between", alignItems:"center", gap:12 }}>
+          <div>
+            <div style={{ color:"#60a5fa", fontWeight:600, fontSize:13 }}>{label}</div>
+            {to && <div style={{ color:"#475569", fontSize:11, marginTop:2 }}>To: {to}</div>}
+          </div>
+          <CopyBtn text={to ? `To: ${to}\n\n${body}` : body} copyId={copyId} />
+        </div>
+        <div style={{ padding:15, whiteSpace:"pre-wrap", fontSize:13, lineHeight:1.75, color:"#cbd5e1" }}>{body}</div>
+      </div>
+    );
+  };
+
+  const draftTitles = { request_forms:"Request Missing Forms", status_update:"Status Update", close_request:"Closure Notification", steward_approval:"Data Steward Approval Request", gerry_handoff:"Handoff to Gerry (GHALL4)" };
+
+  return (
+    <div style={{ fontFamily:"Georgia,serif", background:"#0f1117", minHeight:"100vh", display:"flex", flexDirection:"column" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap');
+        *{box-sizing:border-box}
+        ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:#141720}::-webkit-scrollbar-thumb{background:#2a2d3e;border-radius:3px}
+        .trow:hover{background:#1a1e2e!important}.trow.sel{background:#1a1e2e!important;border-left-color:#60a5fa!important}
+        .srow:hover{background:rgba(96,165,250,.06)!important}
+        .abtn:hover{opacity:.85;transform:translateY(-1px)}
+        .tbtn:hover{color:#94a3b8!important}
+        .drop{border:2px dashed #2a2d3e;border-radius:10px;padding:26px;text-align:center;cursor:pointer;transition:all .2s}
+        .drop:hover{border-color:#60a5fa;background:rgba(96,165,250,.04)}
+        input,select,textarea{font-family:inherit}
+      `}</style>
+
+      {/* Topbar */}
+      <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", height:50, padding:"0 20px", display:"flex", alignItems:"center", gap:18, flexShrink:0 }}>
+        <div style={{ width:7, height:7, borderRadius:"50%", background:"#60a5fa", boxShadow:"0 0 8px #60a5fa" }} />
+        <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, color:"#64748b", letterSpacing:.8 }}>EMORY OIT</span>
+        <span style={{ color:"#2a2d3e" }}>·</span>
+        <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, color:"#60a5fa", letterSpacing:.8 }}>SSO QUEUE MANAGER</span>
+        <div style={{ flex:1 }} />
+        {overdue > 0 && (
+          <div style={{ display:"flex", alignItems:"center", gap:5, background:"rgba(239,68,68,.12)", border:"1px solid rgba(239,68,68,.4)", borderRadius:20, padding:"3px 10px" }}>
+            <div style={{ width:5, height:5, borderRadius:"50%", background:"#ef4444" }} />
+            <span style={{ color:"#fca5a5", fontSize:10, fontFamily:"'JetBrains Mono',monospace" }}>{overdue} overdue</span>
+          </div>
+        )}
+        {["Open","Pending","In Progress","On Hold"].map(s => {
+          const cnt = tickets.filter(t => t.state === s).length;
+          const sm  = STATE_META[s];
+          return (
+            <div key={s} onClick={() => setStateF(f => f===s ? "All" : s)}
+              style={{ cursor:"pointer", display:"flex", alignItems:"center", gap:4, opacity: stateF!=="All"&&stateF!==s ? 0.3 : 1, transition:"opacity .2s" }}>
+              <span style={{ color:sm.color, fontFamily:"'JetBrains Mono',monospace", fontSize:15, fontWeight:700 }}>{cnt}</span>
+              <span style={{ color:"#475569", fontSize:10, fontFamily:"'JetBrains Mono',monospace" }}>{s.toUpperCase()}</span>
+            </div>
+          );
+        })}
+        <div style={{ width:"1px", height:20, background:"#2a2d3e" }} />
+        {/* Import saved progress */}
+        <input ref={importRef} type="file" accept=".json" style={{ display:"none" }} onChange={handleImportJSON} />
+        <button onClick={() => importRef.current?.click()}
+          title="Import saved progress from a JSON backup (exported from localStorage)"
+          style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px", border:"1px solid #10b98155", borderRadius:6, background:"rgba(16,185,129,.08)", color:"#34d399", cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>
+          📂 Import Progress
+        </button>
+        {/* Upload new export */}
+        <input ref={xlsxRef} type="file" accept=".xlsx,.xls" style={{ display:"none" }} onChange={handleXlsxUpload} />
+        <button onClick={() => xlsxRef.current?.click()}
+          style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px", border:"1px solid #2a2d3e", borderRadius:6, background:"transparent", color:"#64748b", cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>
+          📥 Upload New Export
+        </button>
+        {/* Run Report */}
+        <button onClick={() => generateReport(tickets, meta, pct)}
+          style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px", border:"1px solid #60a5fa55", borderRadius:6, background:"rgba(96,165,250,.1)", color:"#60a5fa", cursor:"pointer", fontSize:11, fontFamily:"monospace", fontWeight:600 }}>
+          📊 Run Report
+        </button>
+        <div style={{ width:"1px", height:20, background:"#2a2d3e" }} />
+        {/* API Key button */}
+        <button onClick={() => setShowApiKey(v => !v)}
+          title={apiKey ? "API key is set — click to update" : "Set your Anthropic API key"}
+          style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px", border:`1px solid ${apiKey?"#10b98155":"#f59e0b55"}`, borderRadius:6, background:apiKey?"rgba(16,185,129,.08)":"rgba(245,158,11,.1)", color:apiKey?"#34d399":"#f59e0b", cursor:"pointer", fontSize:11, fontFamily:"monospace", fontWeight:600 }}>
+          🔑 {apiKey ? "Key ✓" : "Set Key"}
+        </button>
+        <div style={{ width:"1px", height:20, background:"#2a2d3e" }} />
+        {/* Google Drive sync */}
+        {(() => {
+          const STATUS = {
+            disconnected: { color:"#475569", bg:"transparent",           border:"#2a2d3e",   icon:"☁️", label:"Connect Drive" },
+            connecting:   { color:"#60a5fa", bg:"rgba(96,165,250,.08)",  border:"#60a5fa55", icon:"⟳",  label:"Connecting…" },
+            syncing:      { color:"#f59e0b", bg:"rgba(245,158,11,.08)",  border:"#f59e0b55", icon:"⟳",  label:"Saving…" },
+            saved:        { color:"#10b981", bg:"rgba(16,185,129,.08)",  border:"#10b98155", icon:"✓",  label:"Drive" },
+            error:        { color:"#f87171", bg:"rgba(239,68,68,.08)",   border:"#f8717155", icon:"⚠",  label:"Drive Error — click to retry" },
+            no_client:    { color:"#f59e0b", bg:"rgba(245,158,11,.08)",  border:"#f59e0b55", icon:"⚠",  label:"Setup needed" },
+          };
+          const s = STATUS[driveStatus] || STATUS.disconnected;
+          const clickable = driveStatus === "disconnected" || driveStatus === "error";
+          return (
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+              <button
+                onClick={clickable ? driveConnect : undefined}
+                style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px", border:`1px solid ${s.border}`, borderRadius:6, background:s.bg, color:s.color, cursor:clickable?"pointer":"default", fontSize:11, fontFamily:"monospace", fontWeight:600, transition:"all .2s" }}>
+                <span>{s.icon}</span>
+                {s.label}
+              </button>
+              {driveMsg && (
+                <span style={{ fontSize:10, color: driveStatus==="error" ? "#f87171" : driveStatus==="saved" ? "#10b981" : "#60a5fa", fontFamily:"monospace", maxWidth:220, whiteSpace:"normal", textAlign:"right", lineHeight:1.3 }}>{driveMsg}</span>
+              )}
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* Drive error banner */}
+      {driveStatus === "error" && driveMsg && (
+        <div style={{ background:"rgba(239,68,68,.12)", borderBottom:"1px solid rgba(239,68,68,.3)", padding:"8px 20px", display:"flex", alignItems:"center", gap:10 }}>
+          <span style={{ color:"#f87171", fontSize:13 }}>⚠</span>
+          <span style={{ color:"#fca5a5", fontSize:12, flex:1 }}>Google Drive error: {driveMsg}</span>
+          <button onClick={driveConnect} style={{ fontSize:11, padding:"3px 10px", border:"1px solid #f8717155", borderRadius:5, background:"rgba(239,68,68,.15)", color:"#f87171", cursor:"pointer" }}>Retry</button>
+          <button onClick={() => { setDriveStatus("disconnected"); setDriveMsg(""); }} style={{ border:"none", background:"none", color:"#475569", cursor:"pointer", fontSize:14 }}>✕</button>
+        </div>
+      )}
+
+      {/* API Key panel */}
+      {showApiKey && (
+        <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", padding:"12px 20px", display:"flex", alignItems:"center", gap:10 }}>
+          <span style={{ fontSize:13 }}>🔑</span>
+          <span style={{ color:"#94a3b8", fontSize:12, whiteSpace:"nowrap" }}>Anthropic API Key:</span>
+          <input
+            type="password"
+            value={apiKeyInput}
+            onChange={e => setApiKeyInput(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") { saveApiKey(apiKeyInput); setApiKey(apiKeyInput); setShowApiKey(false); }}}
+            placeholder="sk-ant-..."
+            style={{ flex:1, maxWidth:420, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"6px 10px", color:"#e2e8f0", fontSize:13, outline:"none", fontFamily:"monospace" }}
+            autoFocus
+          />
+          <button onClick={() => { saveApiKey(apiKeyInput); setApiKey(apiKeyInput); setShowApiKey(false); }}
+            style={{ padding:"6px 16px", border:"1px solid #10b98155", borderRadius:6, background:"rgba(16,185,129,.1)", color:"#34d399", cursor:"pointer", fontSize:12, fontWeight:600 }}>
+            Save
+          </button>
+          {apiKey && (
+            <button onClick={() => { saveApiKey(""); setApiKey(""); setApiKeyInput(""); setShowApiKey(false); }}
+              style={{ padding:"6px 12px", border:"1px solid #f8717155", borderRadius:6, background:"rgba(239,68,68,.08)", color:"#f87171", cursor:"pointer", fontSize:12 }}>
+              Clear
+            </button>
+          )}
+          <button onClick={() => setShowApiKey(false)}
+            style={{ border:"none", background:"none", color:"#475569", cursor:"pointer", fontSize:16, padding:"0 4px" }}>✕</button>
+          <span style={{ color:"#334155", fontSize:11 }}>Stored in your browser only — never sent anywhere except Anthropic's API</span>
+        </div>
+      )}
+
+      {/* Diff banner */}
+      {diffResult && (diffResult.updated.length > 0 || diffResult.newTickets.length > 0) && (
+        <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", padding:"10px 20px", display:"flex", gap:16, alignItems:"flex-start", flexWrap:"wrap" }}>
+          <div style={{ flex:1 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:6, flexWrap:"wrap" }}>
+              <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#475569" }}>📥 {diffResult.fileName} · {diffResult.uploadedAt}</span>
+              {diffResult.newTickets.length > 0 && (
+                <span style={{ fontSize:11, padding:"2px 9px", borderRadius:10, background:"rgba(16,185,129,.15)", color:"#34d399", border:"1px solid rgba(16,185,129,.3)" }}>
+                  ✨ {diffResult.newTickets.length} new ticket{diffResult.newTickets.length>1?"s":""}
+                </span>
+              )}
+              {diffResult.updated.length > 0 && (
+                <span style={{ fontSize:11, padding:"2px 9px", borderRadius:10, background:"rgba(245,158,11,.15)", color:"#fbbf24", border:"1px solid rgba(245,158,11,.3)" }}>
+                  🔄 {diffResult.updated.length} updated
+                </span>
+              )}
+            </div>
+            <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+              {diffResult.newTickets.map(t => (
+                <div key={t.number} style={{ fontSize:11, padding:"3px 9px", background:"rgba(16,185,129,.08)", border:"1px solid rgba(16,185,129,.25)", borderRadius:6, color:"#34d399" }}>
+                  ✨ {t.number} — {t.desc.slice(0,40)}{t.desc.length>40?"…":""}
+                </div>
+              ))}
+              {diffResult.updated.map(t => (
+                <div key={t.number} title={t.changes.join("\n")} style={{ fontSize:11, padding:"3px 9px", background:"rgba(245,158,11,.08)", border:"1px solid rgba(245,158,11,.25)", borderRadius:6, color:"#fbbf24", cursor:"help" }}>
+                  🔄 {t.number} — {t.changes[0]}{t.changes.length>1?` +${t.changes.length-1} more`:""}
+                </div>
+              ))}
+            </div>
+          </div>
+          <button onClick={() => setDiffResult(null)} style={{ border:"none", background:"none", color:"#334155", cursor:"pointer", fontSize:16, padding:"0 4px", flexShrink:0 }}>✕</button>
+        </div>
+      )}
+
+      <div style={{ display:"flex", flex:1, overflow:"hidden" }}>
+
+        {/* Ticket list */}
+        <div style={{ width:345, background:"#141720", borderRight:"1px solid #2a2d3e", display:"flex", flexDirection:"column", flexShrink:0 }}>
+          <div style={{ padding:"10px 12px", borderBottom:"1px solid #2a2d3e", display:"flex", flexDirection:"column", gap:7 }}>
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search tickets…"
+              style={{ width:"100%", background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"7px 10px", color:"#e2e8f0", fontSize:13, outline:"none" }} />
+            <div style={{ display:"flex", gap:6 }}>
+              <select value={stateF} onChange={e => setStateF(e.target.value)}
+                style={{ flex:1, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"5px 7px", color:"#94a3b8", fontSize:11, outline:"none" }}>
+                {["All","Open","Pending","In Progress","On Hold"].map(o => <option key={o}>{o}</option>)}
+              </select>
+              <select value={assigneeF} onChange={e => setAssigneeF(e.target.value)}
+                style={{ flex:1, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"5px 7px", color:"#94a3b8", fontSize:11, outline:"none" }}>
+                {["All","JBURK22","GHALL4","RATNAFU"].map(o => <option key={o}>{o}</option>)}
+              </select>
+            </div>
+            <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+              <div onClick={() => setNeedsRespF(f => !f)}
+                style={{ display:"flex", alignItems:"center", gap:6, flex:1, padding:"5px 9px", borderRadius:6, border:`1px solid ${needsRespF?"#f59e0b55":"#2a2d3e"}`, background:needsRespF?"rgba(245,158,11,.1)":"transparent", cursor:"pointer", transition:"all .15s" }}>
+                <div style={{ width:13, height:13, borderRadius:3, border:`2px solid ${needsRespF?"#f59e0b":"#3a3d52"}`, background:needsRespF?"#f59e0b":"transparent", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                  {needsRespF && <span style={{ color:"white", fontSize:9, fontWeight:700, lineHeight:1 }}>✓</span>}
+                </div>
+                <span style={{ fontSize:11, color:needsRespF?"#fbbf24":"#64748b", whiteSpace:"nowrap" }}>💬 Needs response</span>
+              </div>
+              <div style={{ display:"flex", alignItems:"center", gap:5, flex:1 }}>
+                <span style={{ fontSize:11, color:"#475569", whiteSpace:"nowrap" }}>Stale &gt;</span>
+                <input type="number" min="0" value={staleDays} onChange={e => setStaleDays(e.target.value)} placeholder="days"
+                  style={{ width:"100%", background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"5px 7px", color:"#e2e8f0", fontSize:11, outline:"none" }} />
+              </div>
+            </div>
+          </div>
+          <div style={{ padding:"4px 12px", borderBottom:"1px solid #1a1e2e" }}>
+            <span style={{ color:"#334155", fontSize:10, fontFamily:"'JetBrains Mono',monospace" }}>{visible.length}/{tickets.length} TICKETS</span>
+          </div>
+          <div style={{ flex:1, overflowY:"auto" }}>
+            {visible.map(t => {
+              const isOn    = sel?.number === t.number;
+              const sm      = STATE_META[t.state] || {};
+              const age     = daysSince(t.updated);
+              const fuOv    = t.m.followUp && new Date(t.m.followUp) <= new Date();
+              const waitingOnThem = needsResponse(t);
+              const lastAuthor = lastCommentAuthor(t.comments);
+              return (
+                <div key={t.number} className={`trow${isOn?" sel":""}`}
+                  onClick={() => { setSelected(t); setTab("workflow"); setAiDraft({text:"",loading:false,type:""}); }}
+                  style={{ padding:"11px 12px", borderLeft:"3px solid", borderLeftColor:isOn?"#60a5fa":waitingOnThem?"#f59e0b":"transparent", cursor:"pointer", borderBottom:"1px solid #1a1e2e", transition:"all .15s" }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:3 }}>
+                    <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#334155" }}>{t.number}</span>
+                    <div style={{ display:"flex", gap:3, alignItems:"center" }}>
+                      {fuOv && <span title="Follow-up overdue" style={{fontSize:10}}>🔴</span>}
+                      {waitingOnThem && <span title={`Last comment by ${lastAuthor} — awaiting your response`} style={{fontSize:10}}>💬</span>}
+                      {age>7&&!fuOv && <span title={`${age}d since last update`} style={{fontSize:10}}>⚠️</span>}
+                      {t.m.formAnalysis && <span title="Form analyzed" style={{fontSize:10}}>📄</span>}
+                      <span style={{ fontSize:10, padding:"1px 7px", borderRadius:10, background:sm.bg, color:sm.color, border:`1px solid ${sm.color}55` }}>{t.state}</span>
+                    </div>
+                  </div>
+                  <div style={{ color:isOn?"#e2e8f0":"#94a3b8", fontSize:12.5, lineHeight:1.4, marginBottom:6, fontWeight:isOn?600:400 }}>{t.desc}</div>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                    <div style={{ display:"flex", flexDirection:"column", gap:1 }}>
+                      <span style={{ color:"#334155", fontSize:10, fontFamily:"'JetBrains Mono',monospace" }}>{t.assignee} · {age}d</span>
+                      {lastAuthor && <span style={{ fontSize:10, color:waitingOnThem?"#fbbf24":"#2a3448" }}>↩ {lastAuthor}</span>}
+                    </div>
+                    <div style={{ display:"flex", alignItems:"center", gap:4 }}>
+                      <div style={{ width:40, height:3, background:"#2a2d3e", borderRadius:2 }}>
+                        <div style={{ width:`${pct(t.number)}%`, height:"100%", background:pct(t.number)===100?"#10b981":"#60a5fa", borderRadius:2 }} />
+                      </div>
+                      <span style={{ color:"#334155", fontSize:10 }}>{pct(t.number)}%</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Detail panel */}
+        {sel ? (
+          <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+
+            {/* Header */}
+            <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", padding:"13px 22px" }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
+                <div style={{ flex:1 }}>
+                  <div style={{ display:"flex", gap:7, alignItems:"center", marginBottom:4, flexWrap:"wrap" }}>
+                    <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, color:"#60a5fa" }}>{sel.number}</span>
+                    {sel.ritm && <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, color:"#334155" }}>· {sel.ritm}</span>}
+                    <span style={{ fontSize:10, color:"#334155", background:"#1a1e2e", padding:"1px 7px", borderRadius:4 }}>{sel.type}</span>
+                    <span style={{ fontSize:10, padding:"1px 8px", borderRadius:10, background:STATE_META[sel.state]?.bg, color:STATE_META[sel.state]?.color, border:`1px solid ${STATE_META[sel.state]?.color}55` }}>{sel.state}</span>
+                  </div>
+                  <h2 style={{ margin:"0 0 6px", color:"#f1f5f9", fontSize:16, lineHeight:1.35, fontWeight:600 }}>{sel.desc}</h2>
+                  <div style={{ display:"flex", gap:12, fontSize:11, color:"#475569", fontFamily:"'JetBrains Mono',monospace", flexWrap:"wrap" }}>
+                    <span>👤 {sel.assignee}</span>
+                    {sel.reportedBy && <span>📥 {sel.reportedBy}</span>}
+                    <span>📅 {sel.created}</span>
+                    <span style={{ color:daysSince(sel.updated)>7?"#f87171":"#475569" }}>🔄 {daysSince(sel.updated)}d since update</span>
+                  </div>
+                </div>
+                <div style={{ display:"flex", gap:6, flexShrink:0 }}>
+                  <select value={sel.m.priority||"Normal"} onChange={e => patch(sel.number,{priority:e.target.value})}
+                    style={{ background:"#1a1e2e", border:"1px solid #2a2d3e", borderRadius:6, padding:"5px 8px", color:"#94a3b8", fontSize:11, outline:"none" }}>
+                    {["Low","Normal","High","Urgent"].map(p => <option key={p}>{p}</option>)}
+                  </select>
+                  <a href={snowUrl(sel.number)} target="_blank" rel="noreferrer"
+                    style={{ display:"flex", alignItems:"center", gap:4, background:"#1e3a5f", border:"1px solid #2563eb44", borderRadius:6, padding:"5px 12px", color:"#60a5fa", fontSize:11, textDecoration:"none" }}>
+                    Open in ServiceNow ↗
+                  </a>
+                </div>
+              </div>
+            </div>
+
+            {/* Tabs */}
+            <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", padding:"0 22px", display:"flex" }}>
+              {[["workflow","⚡ Workflow"],["form","📄 Form Analysis"],["draft","✉️ Drafts"],["notes","📝 Notes"],["comments","💬 Comments"]].map(([id,label]) => {
+                const fa = sel.m.formAnalysis;
+                return (
+                  <button key={id} className="tbtn" onClick={() => setTab(id)}
+                    style={{ padding:"10px 16px", border:"none", background:"none", cursor:"pointer", fontSize:13, color:tab===id?"#60a5fa":"#475569", borderBottom:tab===id?"2px solid #60a5fa":"2px solid transparent", marginBottom:-1, transition:"color .15s" }}>
+                    {label}
+                    {id==="form" && fa && <span style={{ marginLeft:5, fontSize:9, background:"#10b981", color:"white", borderRadius:8, padding:"1px 5px" }}>✓</span>}
+                    {id==="form" && fa?.flags?.length>0 && <span style={{ marginLeft:3, fontSize:9, background:"#ef4444", color:"white", borderRadius:8, padding:"1px 5px" }}>{fa.flags.length}</span>}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Tab content */}
+            <div style={{ flex:1, overflowY:"auto", padding:"18px 22px", background:"#0f1117" }}>
+
+              {/* WORKFLOW */}
+              {tab==="workflow" && (
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
+                  <div style={{ gridColumn:"1/-1", background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:18 }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+                      <h3 style={{ margin:0, color:"#e2e8f0", fontSize:14, fontWeight:600 }}>Workflow Checklist</h3>
+                      <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+                        <div style={{ width:80, height:4, background:"#2a2d3e", borderRadius:2 }}>
+                          <div style={{ width:`${pct(sel.number)}%`, height:"100%", background:pct(sel.number)===100?"#10b981":"#60a5fa", borderRadius:2, transition:"width .4s" }} />
+                        </div>
+                        <span style={{ color:"#475569", fontSize:11 }}>{pct(sel.number)}%</span>
+                      </div>
+                    </div>
+
+                    {/* ── Forms exist? ── */}
+                    {(() => {
+                      const wf = sel.m.workflow || {};
+                      const formsExist    = wf.forms_exist;
+                      const loginForm     = wf.login_form;
+                      const confForm      = wf.conf_form;
+                      const secReview     = wf.security_review;
+                      const secProof      = wf.security_review_proof;
+
+                      const StepRow = ({ id, label, icon, checked, onClick, indent=false, dimmed=false, children }) => (
+                        <div style={{ marginBottom:5 }}>
+                          <div className="srow" onClick={onClick}
+                            style={{ display:"flex", alignItems:"center", gap:10, padding:"9px 12px", borderRadius:7,
+                              background:checked?"rgba(16,185,129,.08)":"rgba(255,255,255,.02)",
+                              border:`1px solid ${checked?"rgba(16,185,129,.25)":"#2a2d3e"}`,
+                              cursor:"pointer", opacity:dimmed?0.4:1, transition:"all .15s",
+                              marginLeft: indent ? 24 : 0 }}>
+                            <div style={{ width:18, height:18, borderRadius:4, border:`2px solid ${checked?"#10b981":"#3a3d52"}`,
+                              background:checked?"#10b981":"transparent", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                              {checked && <span style={{ color:"white", fontSize:11, fontWeight:700 }}>✓</span>}
+                            </div>
+                            <span style={{ fontSize:13, color:checked?"#a7f3d0":"#94a3b8" }}>{icon} {label}</span>
+                          </div>
+                          {children}
+                        </div>
+                      );
+
+                      const missingForms = formsExist ? [] : [
+                        ...(!loginForm ? ["Login Request Form"] : []),
+                        ...(!confForm  ? ["Confidentiality Form"] : []),
+                      ];
+
+                      return (
+                        <>
+                          {/* Forms exist? */}
+                          <StepRow id="forms_exist" label="Forms exist?" icon="📋"
+                            checked={formsExist}
+                            onClick={() => toggleStep(sel.number, "forms_exist")}>
+
+                            {/* Sub-items: always show once forms_exist is toggled or forms are partially checked */}
+                            <div style={{ marginLeft:24, marginTop:4, marginBottom:2 }}>
+                              <StepRow id="login_form" label="Login Request Form received" icon="📄"
+                                checked={loginForm} dimmed={false}
+                                onClick={() => toggleStep(sel.number, "login_form")} />
+                              <StepRow id="conf_form" label="Confidentiality Form received" icon="🔒"
+                                checked={confForm} dimmed={false}
+                                onClick={() => toggleStep(sel.number, "conf_form")} />
+                            </div>
+
+                            {/* Missing forms action */}
+                            {(!loginForm || !confForm) && (
+                              <div style={{ marginLeft:24, marginBottom:6 }}>
+                                <div style={{ fontSize:11, color:"#f59e0b", marginBottom:5, padding:"5px 10px", background:"rgba(245,158,11,.08)", borderRadius:6, border:"1px solid rgba(245,158,11,.2)" }}>
+                                  ⚠ Missing: {[!loginForm&&"Login Request Form", !confForm&&"Confidentiality Form"].filter(Boolean).join(" & ")}
+                                </div>
+                                <button className="abtn" onClick={() => genDraft("request_forms")}
+                                  style={{ display:"flex", alignItems:"center", gap:7, padding:"7px 12px", border:"1px solid #f59e0b33", borderRadius:7, background:"#f59e0b11", cursor:"pointer", transition:"all .15s" }}>
+                                  <div style={{ width:3, height:16, borderRadius:2, background:"#f59e0b", flexShrink:0 }} />
+                                  <span style={{ color:"#f59e0b", fontSize:12, fontWeight:600 }}>📧 Generate missing forms email</span>
+                                </button>
+                              </div>
+                            )}
+                          </StepRow>
+
+                          {/* Security review */}
+                          <div style={{ marginBottom:5 }}>
+                            <div className="srow" onClick={() => toggleStep(sel.number, "security_review")}
+                              style={{ display:"flex", alignItems:"center", gap:10, padding:"9px 12px", borderRadius:7,
+                                background:secReview?"rgba(16,185,129,.08)":"rgba(255,255,255,.02)",
+                                border:`1px solid ${secReview?"rgba(16,185,129,.25)":"#2a2d3e"}`,
+                                cursor:"pointer", transition:"all .15s" }}>
+                              <div style={{ width:18, height:18, borderRadius:4, border:`2px solid ${secReview?"#10b981":"#3a3d52"}`,
+                                background:secReview?"#10b981":"transparent", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                                {secReview && <span style={{ color:"white", fontSize:11, fontWeight:700 }}>✓</span>}
+                              </div>
+                              <span style={{ fontSize:13, color:secReview?"#a7f3d0":"#94a3b8" }}>🛡️ Security review completed?</span>
+                            </div>
+
+                            {secReview ? (
+                              /* Yes — ask for proof */
+                              <div style={{ marginLeft:24, marginTop:4 }}>
+                                <div className="srow" onClick={() => toggleStep(sel.number, "security_review_proof")}
+                                  style={{ display:"flex", alignItems:"center", gap:10, padding:"9px 12px", borderRadius:7,
+                                    background:secProof?"rgba(16,185,129,.08)":"rgba(255,255,255,.02)",
+                                    border:`1px solid ${secProof?"rgba(16,185,129,.25)":"#2a2d3e"}`,
+                                    cursor:"pointer", transition:"all .15s" }}>
+                                  <div style={{ width:18, height:18, borderRadius:4, border:`2px solid ${secProof?"#10b981":"#3a3d52"}`,
+                                    background:secProof?"#10b981":"transparent", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                                    {secProof && <span style={{ color:"white", fontSize:11, fontWeight:700 }}>✓</span>}
+                                  </div>
+                                  <span style={{ fontSize:13, color:secProof?"#a7f3d0":"#94a3b8" }}>📎 Proof of security review attached</span>
+                                </div>
+                                {!secProof && (
+                                  <div style={{ marginTop:4, fontSize:11, color:"#f59e0b", padding:"5px 10px", background:"rgba(245,158,11,.08)", borderRadius:6, border:"1px solid rgba(245,158,11,.2)" }}>
+                                    ⚠ Ask requester to attach security review documentation to the ticket
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              /* No — show guide links */
+                              <div style={{ marginLeft:24, marginTop:4, marginBottom:4 }}>
+                                <div style={{ fontSize:11, color:"#94a3b8", marginBottom:6, padding:"7px 10px", background:"rgba(255,255,255,.02)", borderRadius:6, border:"1px solid #2a2d3e" }}>
+                                  Security review required before SSO can go live. Send requester the appropriate link:
+                                </div>
+                                <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+                                  <a href={SR_UNIVERSITY} target="_blank" rel="noreferrer"
+                                    style={{ fontSize:11, padding:"5px 10px", borderRadius:6, background:"rgba(96,165,250,.1)", border:"1px solid #60a5fa33", color:"#60a5fa", textDecoration:"none" }}>
+                                    🎓 University / Research review ↗
+                                  </a>
+                                  <a href={SR_HEALTHCARE} target="_blank" rel="noreferrer"
+                                    style={{ fontSize:11, padding:"5px 10px", borderRadius:6, background:"rgba(16,185,129,.1)", border:"1px solid #10b98133", color:"#34d399", textDecoration:"none" }}>
+                                    🏥 Healthcare review ↗
+                                  </a>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Remaining standard steps */}
+                          {[
+                            { id:"forms_reviewed",    label:"Form review complete",             icon:"🔍" },
+                            { id:"steward_sent",      label:"Data Steward approval requested",  icon:"📨" },
+                            { id:"steward_approved",  label:"Data Steward approval received",   icon:"✅" },
+                            { id:"handoff_to_gerry",  label:"Handed off to Gerry (GHALL4)",     icon:"🤝" },
+                            { id:"implemented",       label:"SSO implemented",                  icon:"🚀" },
+                          ].map(step => {
+                            const done = wf[step.id] || false;
+                            return (
+                              <StepRow key={step.id} id={step.id} label={step.label} icon={step.icon}
+                                checked={done} onClick={() => toggleStep(sel.number, step.id)} />
+                            );
+                          })}
+                        </>
+                      );
+                    })()}
+                  </div>
+
+                  <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:16 }}>
+                    <h3 style={{ margin:"0 0 10px", color:"#e2e8f0", fontSize:14, fontWeight:600 }}>📅 Follow-up Reminder</h3>
+                    <input type="date" value={sel.m.followUp} onChange={e => patch(sel.number,{followUp:e.target.value})}
+                      style={{ width:"100%", background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"7px 10px", color:"#e2e8f0", fontSize:13, outline:"none", marginBottom:8 }} />
+                    {sel.m.followUp && (() => {
+                      const ov = new Date(sel.m.followUp) <= new Date();
+                      return (
+                        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                          <span style={{ fontSize:11, color:ov?"#f87171":"#34d399" }}>{ov ? "⚠ OVERDUE" : `✓ ${sel.m.followUp}`}</span>
+                          <button onClick={() => patch(sel.number,{followUp:""})} style={{ border:"none",background:"none",color:"#475569",cursor:"pointer",fontSize:11 }}>clear</button>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
+                  <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:16 }}>
+                    <h3 style={{ margin:"0 0 10px", color:"#e2e8f0", fontSize:14, fontWeight:600 }}>✉️ Quick Email Drafts</h3>
+                    {[
+                      { type:"request_forms", label:"Request missing forms",  color:"#f59e0b" },
+                      { type:"status_update", label:"Send status update",     color:"#60a5fa" },
+                      { type:"close_request", label:"Closure notification",   color:"#8b5cf6" },
+                    ].map(a => (
+                      <button key={a.type} className="abtn" onClick={() => genDraft(a.type)}
+                        style={{ display:"flex", alignItems:"center", gap:8, width:"100%", marginBottom:7, padding:"9px 12px", border:`1px solid ${a.color}33`, borderRadius:7, background:`${a.color}11`, cursor:"pointer", textAlign:"left", transition:"all .15s" }}>
+                        <div style={{ width:3, height:20, borderRadius:2, background:a.color, flexShrink:0 }} />
+                        <span style={{ color:a.color, fontSize:12, fontWeight:600 }}>{a.label}</span>
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Final attributes + steward approval — full width */}
+                  <div style={{ gridColumn:"1/-1", background:"#141720", borderRadius:10, border:"1px solid #2563eb33", padding:18 }}>
+                    <h3 style={{ margin:"0 0 4px", color:"#e2e8f0", fontSize:14, fontWeight:600 }}>📨 Data Steward Approval Request</h3>
+                    <p style={{ margin:"0 0 14px", color:"#475569", fontSize:12 }}>Document the final confirmed attributes and audience before generating the steward email. These fields override anything pulled from the uploaded form.</p>
+
+                    {/* Audience checkboxes */}
+                    <div style={{ marginBottom:14 }}>
+                      <div style={{ color:"#94a3b8", fontSize:12, marginBottom:7, fontWeight:600 }}>Audience (select all that apply)</div>
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
+                        {["University employees","Healthcare employees","University students","EmoryCard"].map(aud => {
+                          const checked = (sel.m.finalAudience || []).includes(aud);
+                          return (
+                            <div key={aud} onClick={() => {
+                              const cur = sel.m.finalAudience || [];
+                              patch(sel.number, { finalAudience: checked ? cur.filter(a => a!==aud) : [...cur, aud] });
+                            }}
+                              style={{ display:"flex", alignItems:"center", gap:7, padding:"6px 12px", borderRadius:7, border:`1px solid ${checked?"#60a5fa55":"#2a2d3e"}`, background:checked?"rgba(96,165,250,.1)":"transparent", cursor:"pointer", transition:"all .15s" }}>
+                              <div style={{ width:14, height:14, borderRadius:3, border:`2px solid ${checked?"#60a5fa":"#3a3d52"}`, background:checked?"#60a5fa":"transparent", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                                {checked && <span style={{ color:"white", fontSize:10, fontWeight:700, lineHeight:1 }}>✓</span>}
+                              </div>
+                              <span style={{ fontSize:12, color:checked?"#93c5fd":"#64748b" }}>{aud}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Final attributes textarea */}
+                    <div style={{ marginBottom:14 }}>
+                      <div style={{ color:"#94a3b8", fontSize:12, marginBottom:6, fontWeight:600 }}>
+                        Final Confirmed Attributes
+                        <span style={{ color:"#334155", fontWeight:400, marginLeft:8 }}>one per line, e.g. givenName - first name</span>
+                      </div>
+                      <textarea
+                        value={sel.m.finalAttributes || ""}
+                        onChange={e => patch(sel.number, { finalAttributes: e.target.value })}
+                        placeholder={"givenName - first name\nsn - last name\nmail - preferred email address\nserialNumber - Public Person ID\neduPersonNickname - preferred first name"}
+                        style={{ width:"100%", minHeight:110, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:7, padding:"10px 12px", color:"#cbd5e1", fontSize:13, lineHeight:1.6, resize:"vertical", outline:"none" }}
+                      />
+                    </div>
+
+                    <button className="abtn" onClick={() => genDraft("steward_approval")}
+                      style={{ display:"flex", alignItems:"center", gap:8, padding:"10px 18px", border:"1px solid #60a5fa55", borderRadius:8, background:"rgba(96,165,250,.1)", cursor:"pointer", transition:"all .15s" }}>
+                      <span style={{ fontSize:16 }}>📨</span>
+                      <div>
+                        <div style={{ color:"#60a5fa", fontSize:13, fontWeight:600 }}>Generate Data Steward Approval Email</div>
+                        <div style={{ color:"#334155", fontSize:11 }}>Uses audience + attributes above, falls back to form analysis if empty</div>
+                      </div>
+                    </button>
+                  </div>
+
+                  {/* ── Gerry Handoff Panel ── */}
+                  {(() => {
+                    const ssoin = sel.m.ssoin || {};
+                    const patchSsoin = (fields) => patch(sel.number, { ssoin: { ...ssoin, ...fields } });
+
+                    const SSOIN_FIELDS = [
+                      { key:"application_name",                   label:"Application Name",                   required:true },
+                      { key:"application_alternate_names",        label:"Alternate Name(s)",                  required:false },
+                      { key:"application_description",            label:"Application Description",            required:false },
+                      { key:"entityid",                           label:"Entity ID",                          required:true },
+                      { key:"test_url",                           label:"ACS / Test URL",                     required:false },
+                      { key:"slo_url",                            label:"Single Logout URL (SLO)",            required:false },
+                      { key:"application_business_owner_name",    label:"Business Owner Name (Emory Contact)",     required:false },
+                      { key:"application_business_owner_netid",   label:"Business Owner NetID",                    required:false },
+                      { key:"application_technical_owner_name",   label:"Technical Owner Name (Supervisor)",        required:false },
+                      { key:"application_technical_owner_netid",  label:"Technical Owner NetID",                   required:false },
+                      { key:"department_email_address",           label:"Department Email Address",           required:false },
+                      { key:"vendor",                             label:"Vendor",                             required:false },
+                      { key:"vendor_contact_name",                label:"Vendor Contact Name",                required:false },
+                      { key:"vendor_contact_email_address",       label:"Vendor Contact Email",               required:false },
+                      { key:"application_hosting",                label:"Hosting (Cloud/On-Prem/Hybrid)",     required:false },
+                      { key:"application_criticality",            label:"Application Criticality",            required:false },
+                      { key:"application_sensitive_data",         label:"Sensitive Data?",                    required:false },
+                      { key:"application_type",                   label:"Application Type",                   required:false },
+                      { key:"authentication_protocol",            label:"Auth Protocol (SAML/OIDC)",          required:true },
+                      { key:"application_primary_identifier",     label:"Primary Identifier",                 required:true },
+                      { key:"non_ppid_justification",             label:"Non-PPID Justification",             required:false },
+                      { key:"authorization_method",               label:"Authorization Method",               required:false },
+                      { key:"attributes_released",                label:"Attributes Released",                required:true, multiline:true, placeholder:"givenName - legal first name\nsn - last name\nmail - email address" },
+                      { key:"implementation_notes",               label:"Implementation Notes",               required:false, multiline:true },
+                    ];
+
+                    const filled = SSOIN_FIELDS.filter(f => f.required && ssoin[f.key]?.trim()).length;
+                    const reqCount = SSOIN_FIELDS.filter(f => f.required).length;
+                    const ready = filled === reqCount;
+
+                    return (
+                      <div style={{ gridColumn:"1/-1", background:"#141720", borderRadius:10, border:"1px solid rgba(139,92,246,.35)", padding:18 }}>
+                        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
+                          <h3 style={{ margin:0, color:"#e2e8f0", fontSize:14, fontWeight:600 }}>🤝 Hand off to Gerry (GHALL4)</h3>
+                          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                            {sel.m.formAnalysis && (
+                              <button onClick={() => autoPopulateHandoff(sel.number, sel.m.formAnalysis)}
+                                title="Re-reads all fields from the analyzed form and overwrites current handoff values"
+                                style={{ fontSize:11, padding:"3px 9px", border:"1px solid #f59e0b33", borderRadius:5, background:"rgba(245,158,11,.08)", color:"#f59e0b", cursor:"pointer" }}>
+                                🔄 Refresh from form
+                              </button>
+                            )}
+                            <span style={{ fontSize:11, fontFamily:"monospace", color:ready?"#10b981":"#475569" }}>
+                              {filled}/{reqCount} required fields filled {ready?"✓":""}
+                            </span>
+                          </div>
+                        </div>
+                        <p style={{ margin:"0 0 14px", color:"#475569", fontSize:12 }}>
+                          Fill in the SSOIN fields below, then generate the handoff message for Gerry to implement.
+                          Fields marked <span style={{ color:"#f87171" }}>*</span> are required.
+                        </p>
+
+                        {ssoin.metadata_file && (
+                          <div style={{ marginBottom:12, padding:"7px 12px", background:"rgba(16,185,129,.08)", border:"1px solid rgba(16,185,129,.25)", borderRadius:7, fontSize:11, color:"#34d399", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                            <span>🔗 Metadata parsed from: <strong>{ssoin.metadata_file}</strong>{ssoin.entityid ? ` · Entity ID: ${ssoin.entityid}` : ""}</span>
+                            <button onClick={() => { const s = {...ssoin}; delete s.metadata_xml; delete s.metadata_file; delete s.slo_url; patch(sel.number,{ssoin:s}); }}
+                              style={{ border:"none", background:"none", color:"#475569", cursor:"pointer", fontSize:11 }}>remove</button>
+                          </div>
+                        )}
+
+                        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
+                          {SSOIN_FIELDS.filter(f => !f.multiline).map(f => (
+                            <div key={f.key}>
+                              <div style={{ fontSize:11, color: f.required?"#94a3b8":"#475569", marginBottom:3 }}>
+                                {f.label}{f.required && <span style={{ color:"#f87171" }}> *</span>}
+                              </div>
+                              <input
+                                value={ssoin[f.key] || ""}
+                                onChange={e => patchSsoin({ [f.key]: e.target.value })}
+                                placeholder={f.placeholder || ""}
+                                style={{ width:"100%", background:"#0f1117", border:`1px solid ${ssoin[f.key]?.trim() ? "#2563eb44" : "#2a2d3e"}`, borderRadius:6, padding:"6px 10px", color:"#cbd5e1", fontSize:12, outline:"none", boxSizing:"border-box" }}
+                              />
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* Multiline fields */}
+                        {SSOIN_FIELDS.filter(f => f.multiline).map(f => (
+                          <div key={f.key} style={{ marginBottom:10 }}>
+                            <div style={{ fontSize:11, color: f.required?"#94a3b8":"#475569", marginBottom:3 }}>
+                              {f.label}{f.required && <span style={{ color:"#f87171" }}> *</span>}
+                            </div>
+                            <textarea
+                              value={ssoin[f.key] || ""}
+                              onChange={e => patchSsoin({ [f.key]: e.target.value })}
+                              placeholder={f.placeholder || ""}
+                              style={{ width:"100%", minHeight: f.key==="attributes_released"?100:60, background:"#0f1117", border:`1px solid ${ssoin[f.key]?.trim()?"#2563eb44":"#2a2d3e"}`, borderRadius:6, padding:"8px 10px", color:"#cbd5e1", fontSize:12, lineHeight:1.6, resize:"vertical", outline:"none" }}
+                            />
+                          </div>
+                        ))}
+
+                        {/* Fill from finalAttributes shortcut */}
+                        {sel.m.finalAttributes?.trim() && !ssoin.attributes_released?.trim() && (
+                          <button onClick={() => patchSsoin({ attributes_released: sel.m.finalAttributes })}
+                            style={{ fontSize:11, padding:"4px 10px", border:"1px solid #2563eb44", borderRadius:5, background:"rgba(96,165,250,.08)", color:"#60a5fa", cursor:"pointer", marginBottom:12 }}>
+                            ↑ Copy from Final Confirmed Attributes above
+                          </button>
+                        )}
+
+                        <button className="abtn" onClick={() => genDraft("gerry_handoff")}
+                          style={{ display:"flex", alignItems:"center", gap:8, padding:"10px 18px", border:"1px solid rgba(139,92,246,.4)", borderRadius:8, background:"rgba(139,92,246,.1)", cursor:"pointer", transition:"all .15s" }}>
+                          <span style={{ fontSize:16 }}>🤝</span>
+                          <div>
+                            <div style={{ color:"#a78bfa", fontSize:13, fontWeight:600 }}>Generate Gerry Handoff Message</div>
+                            <div style={{ color:"#334155", fontSize:11 }}>Attributes approved — ready for implementation</div>
+                          </div>
+                        </button>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {/* FORM ANALYSIS */}
+              {tab==="form" && (() => {
+                const fa = sel.m.formAnalysis;
+                return (
+                  <div>
+                    {/* Request Form upload */}
+                    <div className="drop" onClick={() => fileRef.current?.click()} style={{ marginBottom:10 }}>
+                      <input ref={fileRef} type="file" accept=".pdf,.docx" style={{ display:"none" }} onChange={handleUpload} />
+                      {formBusy
+                        ? <div style={{ color:"#60a5fa" }}><div style={{ fontSize:20, marginBottom:6 }}>⟳</div><div style={{ fontSize:12 }}>Reading and analyzing form…</div></div>
+                        : <div>
+                            <div style={{ fontSize:24, marginBottom:5 }}>📄</div>
+                            <div style={{ color:"#94a3b8", fontSize:13 }}>{fa ? `Replace: ${fa.fileName}` : "Click to upload Login Request Form"}</div>
+                            <div style={{ color:"#334155", fontSize:11, marginTop:3 }}>Accepts PDF or DOCX · AI will analyze and auto-populate handoff fields</div>
+                          </div>
+                      }
+                    </div>
+
+                    {/* Metadata XML upload */}
+                    <div className="drop" onClick={() => metaRef.current?.click()} style={{ marginBottom:16, borderColor: sel.m.ssoin?.metadata_file ? "#10b98155" : undefined, background: sel.m.ssoin?.metadata_file ? "rgba(16,185,129,.03)" : undefined }}>
+                      <input ref={metaRef} type="file" accept=".xml,text/xml,application/xml" style={{ display:"none" }} onChange={handleMetadataUpload} />
+                      {metaBusy
+                        ? <div style={{ color:"#10b981" }}><div style={{ fontSize:20, marginBottom:6 }}>⟳</div><div style={{ fontSize:12 }}>Parsing metadata…</div></div>
+                        : <div>
+                            <div style={{ fontSize:24, marginBottom:5 }}>🔗</div>
+                            <div style={{ color: sel.m.ssoin?.metadata_file ? "#34d399" : "#94a3b8", fontSize:13 }}>
+                              {sel.m.ssoin?.metadata_file ? `✓ ${sel.m.ssoin.metadata_file}` : "Click to upload SAML Metadata XML"}
+                            </div>
+                            <div style={{ color:"#334155", fontSize:11, marginTop:3 }}>Extracts Entity ID, ACS URL, and org name → auto-fills handoff fields</div>
+                          </div>
+                      }
+                    </div>
+                    {fa && !fa.emoryContact && (
+                      <div style={{ marginBottom:12, padding:"8px 12px", background:"rgba(245,158,11,.1)", border:"1px solid rgba(245,158,11,.3)", borderRadius:7, fontSize:12, color:"#fbbf24" }}>
+                        ⚠ This analysis was run before owner extraction was added. <strong>Re-upload the form</strong> to get Emory Contact and Supervisor populated automatically.
+                      </div>
+                    )}
+                    {formErr && <div style={{ color:"#f87171", fontSize:12, marginBottom:12, padding:"8px 12px", background:"rgba(239,68,68,.1)", borderRadius:6 }}>⚠ {formErr}</div>}
+
+                    {fa && (
+                      <>
+                        {fa.flags?.length > 0
+                          ? <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:16, marginBottom:14 }}>
+                              <h3 style={{ margin:"0 0 10px", color:"#f87171", fontSize:14, fontWeight:600 }}>⚠ Issues Requiring Follow-up ({fa.flags.length})</h3>
+                              {fa.flags.map((f,i) => (
+                                <div key={i} style={{ display:"flex", gap:8, padding:"8px 12px", background:"rgba(239,68,68,.07)", border:"1px solid rgba(239,68,68,.22)", borderRadius:6, marginBottom:5 }}>
+                                  <span style={{ color:"#f87171", flexShrink:0 }}>⚠</span>
+                                  <span style={{ color:"#fca5a5", fontSize:13, lineHeight:1.5 }}>{f}</span>
+                                </div>
+                              ))}
+                            </div>
+                          : <div style={{ background:"rgba(16,185,129,.08)", border:"1px solid rgba(16,185,129,.3)", borderRadius:8, padding:"10px 14px", marginBottom:14, color:"#34d399", fontSize:13 }}>
+                              ✅ No issues found — form looks complete.
+                            </div>
+                        }
+
+                        <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:16, marginBottom:14 }}>
+                          <h3 style={{ margin:"0 0 10px", color:"#e2e8f0", fontSize:14, fontWeight:600 }}>📋 Form Summary</h3>
+                          {[
+                            ["Application",      fa.appName,           null],
+                            ["Description",      fa.appDescription,    null],
+                            ["Emory Contact",    fa.emoryContact ? `${fa.emoryContact}${fa.emoryContactNetId ? ` (${fa.emoryContactNetId})` : ""}` : null, fa.emoryContact ? true : false],
+                            ["Supervisor",       fa.supervisorName ? `${fa.supervisorName}${fa.supervisorNetId ? ` (${fa.supervisorNetId})` : ""}` : null, fa.supervisorName ? true : false],
+                            ["Vendor",           fa.vendor,            null],
+                            ["Vendor Contact",   fa.vendorContact,     null],
+                            ["Audience",         fa.audience?.join(", "), null],
+                            ["Attributes",       fa.attributes?.join(", "), null],
+                            ["Entity ID",        fa.entityId,          null],
+                            ["Test URL",         fa.testUrl,           null],
+                            ["Hosting",          fa.hosting,           null],
+                            ["Includes PPID",    fa.hasPPID?"Yes":"No", fa.hasPPID],
+                            ["Supports SAML",    fa.supportsSAML,       fa.supportsSAML==="Yes"],
+                            ["Security Review",  fa.securityReview,     fa.securityReview==="Completed"],
+                            ["Access Control",   fa.accessLimitation,   null],
+                            ["Analyzed",         fa.at ? new Date(fa.at).toLocaleString() : "", null],
+                          ].map(([label,val,good]) => val ? (
+                            <div key={label} style={{ display:"flex", gap:12, padding:"6px 0", borderBottom:"1px solid #1a1e2e" }}>
+                              <span style={{ color:"#475569", fontSize:11, width:155, flexShrink:0 }}>{label}</span>
+                              <span style={{ fontSize:13, color: good===false?"#f87171":good===true?"#34d399":"#94a3b8" }}>{val}</span>
+                            </div>
+                          ) : null)}
+                        </div>
+
+                        <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:16 }}>
+                          <h3 style={{ margin:"0 0 12px", color:"#e2e8f0", fontSize:14, fontWeight:600 }}>✉️ Generated Email Drafts</h3>
+                          <EmailBlock label="Data Steward Approval Request"            to={fa.stewardTo}                          body={fa.stewardBody}    copyId="steward_e" />
+                          <EmailBlock label="Requester Follow-up (issues to resolve)"  to={fa.requesterName||fa.requesterEmail}   body={fa.requesterBody}  copyId="req_e" />
+                          {!fa.stewardBody && !fa.requesterBody &&
+                            <div style={{ color:"#334155", fontSize:13, textAlign:"center", padding:"16px 0" }}>No email drafts needed — form appears complete.</div>}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* DRAFTS */}
+              {tab==="draft" && (
+                <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:18 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
+                    <div>
+                      <h3 style={{ margin:"0 0 6px", color:"#e2e8f0", fontSize:14, fontWeight:600 }}>
+                        ✉️ {draftTitles[aiDraft.type] || "Email Draft"}
+                      </h3>
+                      {aiDraft.subject && (
+                        <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:3 }}>
+                          <span style={{ color:"#475569", fontSize:11, width:52, flexShrink:0 }}>Subject:</span>
+                          <span style={{ color:"#93c5fd", fontSize:12, fontWeight:600 }}>{aiDraft.subject}</span>
+                        </div>
+                      )}
+                      {aiDraft.stewardTo && (
+                        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                          <span style={{ color:"#475569", fontSize:11, width:52, flexShrink:0 }}>To:</span>
+                          <span style={{ color:"#94a3b8", fontSize:12 }}>{aiDraft.stewardTo}</span>
+                        </div>
+                      )}
+                    </div>
+                    {aiDraft.text && (
+                      <CopyBtn
+                        text={[
+                          aiDraft.subject   ? `Subject: ${aiDraft.subject}`   : "",
+                          aiDraft.stewardTo ? `To: ${aiDraft.stewardTo}` : "",
+                          "",
+                          aiDraft.text,
+                        ].filter(l => l !== null && !(l === "" && !aiDraft.subject && !aiDraft.stewardTo)).join("\n").trimStart()}
+                        copyId="main_d"
+                      />
+                    )}
+                  </div>
+                  {aiDraft.loading
+                    ? <div style={{ textAlign:"center", padding:"44px 0", color:"#475569" }}><div style={{ fontSize:20, marginBottom:7 }}>⟳</div><div style={{ fontSize:11 }}>Generating…</div></div>
+                    : aiDraft.text
+                      ? <div style={{ background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:8, padding:15, whiteSpace:"pre-wrap", fontSize:13, lineHeight:1.75, color:"#cbd5e1" }}>{aiDraft.text}</div>
+                      : <div style={{ textAlign:"center", padding:"44px 0", color:"#334155" }}><div style={{ fontSize:28, marginBottom:8 }}>✉️</div><div style={{ fontSize:13 }}>Use the Workflow tab buttons to generate a draft</div></div>
+                  }
+                  {!aiDraft.loading && (
+                    <div style={{ marginTop:12, display:"flex", gap:6, flexWrap:"wrap" }}>
+                      {[["request_forms","Request Forms"],["steward_approval","Steward Approval"],["status_update","Status Update"],["close_request","Closure"]].map(([type,label]) => (
+                        <button key={type} onClick={() => genDraft(type)}
+                          style={{ padding:"5px 12px", border:"1px solid #2a2d3e", borderRadius:6, background:aiDraft.type===type?"#1a1e2e":"transparent", color:"#64748b", cursor:"pointer", fontSize:11 }}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* NOTES */}
+              {tab==="notes" && (
+                <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:18 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+                    <h3 style={{ margin:0, color:"#e2e8f0", fontSize:14, fontWeight:600 }}>📝 Internal Notes</h3>
+                    <span style={{ color:"#334155", fontSize:10 }}>Auto-saved</span>
+                  </div>
+                  <textarea value={sel.m.note} onChange={e => patch(sel.number,{note:e.target.value})}
+                    placeholder="Track open questions, decisions, blockers, next steps…"
+                    style={{ width:"100%", minHeight:360, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:8, padding:13, color:"#cbd5e1", fontSize:14, lineHeight:1.7, resize:"vertical", outline:"none" }} />
+                </div>
+              )}
+
+              {/* COMMENTS */}
+              {tab==="comments" && (
+                <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:18 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+                    <h3 style={{ margin:0, color:"#e2e8f0", fontSize:14, fontWeight:600 }}>💬 ServiceNow Comments</h3>
+                    <a href={snowUrl(sel.number)} target="_blank" rel="noreferrer" style={{ color:"#60a5fa", fontSize:11, textDecoration:"none" }}>View live ↗</a>
+                  </div>
+                  {sel.comments
+                    ? <div style={{ whiteSpace:"pre-wrap", fontSize:13, lineHeight:1.8, color:"#94a3b8", background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:8, padding:13 }}>{sel.comments}</div>
+                    : <div style={{ textAlign:"center", padding:"34px 0", color:"#334155" }}>
+                        <div style={{ fontSize:22, marginBottom:7 }}>💬</div>
+                        <div style={{ fontSize:13 }}>No comments in this snapshot — open in ServiceNow for live activity.</div>
+                      </div>
+                  }
+                </div>
+              )}
+            </div>
+          </div>
+        ) : showReport ? (
+          <div style={{ flex:1, overflowY:"auto", padding:"20px 24px", background:"#0f1117" }}>
+            {/* Summary row */}
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:18 }}>
+              <div>
+                <h2 style={{ margin:"0 0 3px", color:"#f1f5f9", fontSize:18, fontWeight:700 }}>📊 Pending Actions Report</h2>
+                <div style={{ color:"#475569", fontSize:11, fontFamily:"monospace" }}>{new Date().toLocaleString()} · {tickets.length} tickets</div>
+              </div>
+            </div>
+            {/* State summary */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:20 }}>
+              {["Open","Pending","In Progress","On Hold"].map(s => {
+                const cnt = tickets.filter(t => t.state===s).length;
+                const sm  = STATE_META[s];
+                return (
+                  <div key={s} style={{ background:"#141720", border:`1px solid ${sm.color}33`, borderRadius:8, padding:"12px 16px", textAlign:"center" }}>
+                    <div style={{ fontSize:24, fontWeight:700, color:sm.color }}>{cnt}</div>
+                    <div style={{ fontSize:10, color:sm.color, opacity:.7, fontFamily:"monospace" }}>{s.toUpperCase()}</div>
+                  </div>
+                );
+              })}
+            </div>
+            {/* Ticket cards */}
+            {tickets.map(t => {
+              const m        = meta[t.number] || blankMeta();
+              const wf       = m.workflow || {};
+              const pending  = WORKFLOW_STEPS.filter(s => !wf[s.id]);
+              const done     = WORKFLOW_STEPS.filter(s =>  wf[s.id]);
+              const p        = pct(t.number);
+              const nr       = needsResponse(t);
+              const lastAuth = lastCommentAuthor(t.comments);
+              const fuOv     = m.followUp && new Date(m.followUp) <= new Date();
+              const formFlags = m.formAnalysis?.flags || [];
+              const sm       = STATE_META[t.state] || {};
+              const hasActions = nr || fuOv || formFlags.length > 0;
+              return (
+                <div key={t.number} style={{ background:"#141720", border:"1px solid #2a2d3e", borderRadius:10, padding:16, marginBottom:12 }}>
+                  {/* Header */}
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10 }}>
+                    <div style={{ flex:1 }}>
+                      <div style={{ display:"flex", gap:7, alignItems:"center", marginBottom:3, flexWrap:"wrap" }}>
+                        <span style={{ fontFamily:"monospace", fontSize:10, color:"#334155" }}>{t.number}</span>
+                        {t.ritm && <span style={{ fontFamily:"monospace", fontSize:10, color:"#2a3448" }}>· {t.ritm}</span>}
+                        <span style={{ fontSize:10, padding:"1px 7px", borderRadius:10, background:sm.bg, color:sm.color, border:`1px solid ${sm.color}55` }}>{t.state}</span>
+                        {nr && <span style={{ fontSize:10, padding:"1px 7px", borderRadius:10, background:"rgba(245,158,11,.15)", color:"#fbbf24", border:"1px solid rgba(245,158,11,.3)" }}>💬 Needs response</span>}
+                        {fuOv && <span style={{ fontSize:10, padding:"1px 7px", borderRadius:10, background:"rgba(239,68,68,.15)", color:"#f87171", border:"1px solid rgba(239,68,68,.3)" }}>🔴 Follow-up overdue</span>}
+                      </div>
+                      <div style={{ color:"#e2e8f0", fontSize:14, fontWeight:600, marginBottom:4 }}>{t.desc}</div>
+                      <div style={{ color:"#475569", fontSize:11, fontFamily:"monospace" }}>👤 {t.assignee} · 📅 {t.created} · 🔄 {t.updated}{lastAuth ? ` · ↩ ${lastAuth}` : ""}</div>
+                    </div>
+                    <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:4, flexShrink:0, marginLeft:12 }}>
+                      <div style={{ width:80, height:4, background:"#2a2d3e", borderRadius:2 }}>
+                        <div style={{ width:`${p}%`, height:"100%", background:p===100?"#10b981":"#60a5fa", borderRadius:2 }} />
+                      </div>
+                      <span style={{ fontSize:10, color:"#334155", fontFamily:"monospace" }}>{p}% complete</span>
+                      <button onClick={() => { setShowReport(false); setSelected(t); }}
+                        style={{ fontSize:10, padding:"3px 9px", border:"1px solid #2a2d3e", borderRadius:5, background:"transparent", color:"#60a5fa", cursor:"pointer" }}>
+                        Open ↗
+                      </button>
+                    </div>
+                  </div>
+
+                  <div style={{ display:"grid", gridTemplateColumns: pending.length && done.length ? "1fr 1fr" : "1fr", gap:12 }}>
+                    {/* Pending steps */}
+                    {pending.length > 0 && (
+                      <div>
+                        <div style={{ fontSize:10, fontWeight:700, color:"#475569", textTransform:"uppercase", letterSpacing:.6, marginBottom:5 }}>📋 Pending Steps</div>
+                        {pending.map(s => (
+                          <div key={s.id} style={{ fontSize:12, padding:"4px 0", borderBottom:"1px solid #1a1e2e", color:"#94a3b8" }}>{s.icon} {s.label}</div>
+                        ))}
+                      </div>
+                    )}
+                    {/* Done steps */}
+                    {done.length > 0 && pending.length > 0 && (
+                      <div>
+                        <div style={{ fontSize:10, fontWeight:700, color:"#475569", textTransform:"uppercase", letterSpacing:.6, marginBottom:5 }}>✓ Completed</div>
+                        {done.map(s => (
+                          <div key={s.id} style={{ fontSize:12, padding:"4px 0", borderBottom:"1px solid #1a1e2e", color:"#334155", textDecoration:"line-through" }}>✓ {s.label}</div>
+                        ))}
+                      </div>
+                    )}
+                    {pending.length === 0 && (
+                      <div style={{ color:"#10b981", fontSize:12, fontStyle:"italic" }}>✅ All workflow steps complete</div>
+                    )}
+                  </div>
+
+                  {/* Form flags */}
+                  {formFlags.length > 0 && (
+                    <div style={{ marginTop:10 }}>
+                      <div style={{ fontSize:10, fontWeight:700, color:"#475569", textTransform:"uppercase", letterSpacing:.6, marginBottom:5 }}>⚠ Form Issues</div>
+                      {formFlags.map((f,i) => (
+                        <div key={i} style={{ fontSize:12, padding:"4px 8px", background:"rgba(239,68,68,.07)", border:"1px solid rgba(239,68,68,.2)", borderRadius:5, color:"#fca5a5", marginBottom:3 }}>{f}</div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Notes */}
+                  {m.note?.trim() && (
+                    <div style={{ marginTop:10, fontSize:12, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"8px 10px", color:"#64748b", whiteSpace:"pre-wrap" }}>
+                      <span style={{ color:"#334155", fontWeight:700 }}>📝 </span>{m.note.trim()}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"#0f1117", gap:12 }}>
+            <div style={{ fontSize:46 }}>🛡️</div>
+            <div style={{ fontSize:17, color:"#334155", fontWeight:600 }}>Select a ticket to begin</div>
+            <div style={{ fontSize:12, color:"#2a2d3e" }}>{tickets.length} active SSO requests · {overdue} follow-ups due</div>
+            <div style={{ display:"flex", gap:13, marginTop:10 }}>
+              {["Open","Pending","In Progress","On Hold"].map(s => {
+                const cnt = tickets.filter(t => t.state===s).length;
+                const sm  = STATE_META[s];
+                return (
+                  <div key={s} onClick={() => setStateF(s)} style={{ cursor:"pointer", textAlign:"center", padding:"11px 16px", border:`1px solid ${sm.color}33`, borderRadius:10, background:sm.bg }}>
+                    <div style={{ fontSize:22, fontWeight:700, color:sm.color }}>{cnt}</div>
+                    <div style={{ fontSize:10, color:sm.color, opacity:.7 }}>{s}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
