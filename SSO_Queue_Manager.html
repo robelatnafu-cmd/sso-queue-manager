@@ -245,8 +245,8 @@ const STATE_META = {
   "Closed":      { color:"#475569", bg:"rgba(71,85,105,0.12)"  },
 };
 
-const STORAGE_KEY         = "sso_mgr_v5";
-const TICKETS_STORAGE_KEY = "sso_mgr_tickets_v5";
+const STORAGE_KEY         = "sso_mgr_v6";
+const TICKETS_STORAGE_KEY = "sso_mgr_tickets_v6";
 const API_KEY_STORAGE     = "sso_mgr_apikey";
 const daysSince  = (d) => Math.floor((Date.now() - new Date(d)) / 86400000);
 const loadMeta   = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); } catch { return {}; } };
@@ -738,6 +738,17 @@ function App() {
     return true;
   });
 
+  // Base filtered by everything EXCEPT state — drives the topbar counters so they reflect current filters
+  const filteredBase = tickets.filter(t => {
+    if (t.state === "Closed") return false;
+    if (assigneeF !== "All" && t.assignee !== assigneeF) return false;
+    if (search && !t.desc.toLowerCase().includes(search.toLowerCase()) &&
+        !t.number.toLowerCase().includes(search.toLowerCase()))        return false;
+    if (needsRespF && !needsResponse(t))                               return false;
+    if (staleDays !== "" && daysSince(t.updated) < parseInt(staleDays)) return false;
+    return true;
+  });
+
   const overdue = tickets.filter(t => t.m.followUp && new Date(t.m.followUp) <= new Date()).length;
   const sel     = selected ? tickets.find(t => t.number === selected.number) : null;
 
@@ -1126,7 +1137,7 @@ mail - email address"
           </div>
         )}
         {["Open","Pending","In Progress","On Hold"].map(s => {
-          const cnt = tickets.filter(t => t.state === s).length;
+          const cnt = filteredBase.filter(t => t.state === s).length;
           const sm  = STATE_META[s];
           return (
             <div key={s} onClick={() => setStateF(f => f===s ? "All" : s)}
@@ -1314,13 +1325,15 @@ mail - email address"
               </div>
             </div>
           </div>
-          <div style={{ padding:"6px 12px", borderBottom:"1px solid #1a1e2e", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-            <span style={{ color:"#334155", fontSize:10, fontFamily:"'JetBrains Mono',monospace" }}>
-              {visible.length === tickets.filter(t => t.state !== "Closed").length
-                ? <>{visible.length} <span style={{ color:"#2a2d3e" }}>TICKETS</span></>
-                : <><span style={{ color:"#60a5fa", fontWeight:700 }}>{visible.length}</span> <span style={{ color:"#2a2d3e" }}>of {tickets.filter(t => t.state !== "Closed").length} TICKETS</span></>
-              }
-            </span>
+          <div style={{ padding:"7px 12px", borderBottom:"1px solid #1a1e2e", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+            <div style={{ display:"flex", alignItems:"baseline", gap:5 }}>
+              <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:16, fontWeight:700, color:"#60a5fa" }}>{visible.length}</span>
+              <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#475569" }}>
+                {visible.length === tickets.filter(t => t.state !== "Closed").length
+                  ? "TOTAL TICKETS"
+                  : `of ${tickets.filter(t => t.state !== "Closed").length} TOTAL`}
+              </span>
+            </div>
             {(stateF !== "All" || assigneeF !== "All" || search || needsRespF || staleDays !== "") && (
               <button onClick={() => { setStateF("All"); setAssigneeF("All"); setSearch(""); setNeedsRespF(false); setStaleDays(""); }}
                 style={{ fontSize:9, padding:"2px 7px", border:"1px solid #2a2d3e", borderRadius:4, background:"transparent", color:"#475569", cursor:"pointer", fontFamily:"monospace", letterSpacing:.4 }}>
@@ -2061,10 +2074,10 @@ mail - email address"
           <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"#0f1117", gap:12 }}>
             <div style={{ fontSize:46 }}>🛡️</div>
             <div style={{ fontSize:17, color:"#334155", fontWeight:600 }}>Select a ticket to begin</div>
-            <div style={{ fontSize:12, color:"#2a2d3e" }}>{tickets.length} active SSO requests · {overdue} follow-ups due</div>
+            <div style={{ fontSize:12, color:"#2a2d3e" }}>{filteredBase.length} active SSO requests · {overdue} follow-ups due</div>
             <div style={{ display:"flex", gap:13, marginTop:10 }}>
               {["Open","Pending","In Progress","On Hold"].map(s => {
-                const cnt = tickets.filter(t => t.state===s).length;
+                const cnt = filteredBase.filter(t => t.state===s).length;
                 const sm  = STATE_META[s];
                 return (
                   <div key={s} onClick={() => setStateF(s)} style={{ cursor:"pointer", textAlign:"center", padding:"11px 16px", border:`1px solid ${sm.color}33`, borderRadius:10, background:sm.bg }}>
