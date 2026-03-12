@@ -52,7 +52,7 @@ function loadGIS() {
 }
 
 // Request token via GIS TokenClient (popup consent flow)
-function gAuthorize() {
+function gAuthorize(silent = false) {
   return new Promise(async (resolve, reject) => {
     try { await loadGIS(); } catch(e) { reject(new Error("Failed to load Google auth library: " + e.message)); return; }
     if (!window.google?.accounts?.oauth2) { reject(new Error("Google Identity Services not available")); return; }
@@ -60,7 +60,7 @@ function gAuthorize() {
     let settled = false;
     const timeout = setTimeout(() => {
       if (!settled) { settled = true; reject(new Error("Auth timed out — popup may be blocked. Allow popups for claude.ai and try again.")); }
-    }, 60000);
+    }, silent ? 10000 : 60000);
 
     try {
       const client = window.google.accounts.oauth2.initTokenClient({
@@ -80,7 +80,8 @@ function gAuthorize() {
           resolve(_gToken);
         },
       });
-      client.requestAccessToken({ prompt: "select_account" });
+      // silent=true skips the account picker if consent was already granted
+      client.requestAccessToken({ prompt: silent ? "" : "select_account" });
     } catch (e) {
       if (!settled) { settled = true; clearTimeout(timeout); reject(e); }
     }
@@ -538,11 +539,11 @@ function App() {
   const importRef     = useRef();
 
   // ── Drive: connect + initial load ──
-  async function driveConnect() {
+  async function driveConnect(silent = false) {
     setDriveStatus("connecting");
-    setDriveMsg("Opening Google sign-in popup…");
+    setDriveMsg(silent ? "Reconnecting to Drive…" : "Opening Google sign-in popup…");
     try {
-      const token = gTokenValid() ? _gToken : await gAuthorize();
+      const token = gTokenValid() ? _gToken : await gAuthorize(silent);
       setDriveStatus("syncing");
       setDriveMsg("Signed in — loading data from Drive…");
       const remote = await gLoad(token);
@@ -569,11 +570,20 @@ function App() {
         setDriveMsg("✓ Connected — no saved file yet, will create on first change");
       }
       setDriveStatus("saved");
+      localStorage.setItem("sso_mgr_drive_connected", "1");
     } catch (e) {
       setDriveStatus("error");
-      setDriveMsg(e.message || "Auth failed");
+      setDriveMsg(silent ? "" : (e.message || "Auth failed"));
+      if (silent) setDriveStatus("disconnected"); // silent fail = just show Connect button, no error
     }
   }
+
+  // ── Auto-reconnect silently on page load if previously connected ──
+  useEffect(() => {
+    if (localStorage.getItem("sso_mgr_drive_connected") === "1") {
+      driveConnect(true);
+    }
+  }, []);
 
   // ── Drive: debounced auto-save whenever meta or ticketList changes ──
   useEffect(() => {
@@ -1196,7 +1206,7 @@ mail - email address"
           return (
             <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
               <button
-                onClick={clickable ? driveConnect : undefined}
+                onClick={clickable ? () => driveConnect(false) : undefined}
                 style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px", border:`1px solid ${s.border}`, borderRadius:6, background:s.bg, color:s.color, cursor:clickable?"pointer":"default", fontSize:11, fontFamily:"monospace", fontWeight:600, transition:"all .2s" }}>
                 <span>{s.icon}</span>
                 {s.label}
@@ -1214,8 +1224,8 @@ mail - email address"
         <div style={{ background:"rgba(239,68,68,.12)", borderBottom:"1px solid rgba(239,68,68,.3)", padding:"8px 20px", display:"flex", alignItems:"center", gap:10 }}>
           <span style={{ color:"#f87171", fontSize:13 }}>⚠</span>
           <span style={{ color:"#fca5a5", fontSize:12, flex:1 }}>Google Drive error: {driveMsg}</span>
-          <button onClick={driveConnect} style={{ fontSize:11, padding:"3px 10px", border:"1px solid #f8717155", borderRadius:5, background:"rgba(239,68,68,.15)", color:"#f87171", cursor:"pointer" }}>Retry</button>
-          <button onClick={() => { setDriveStatus("disconnected"); setDriveMsg(""); }} style={{ border:"none", background:"none", color:"#475569", cursor:"pointer", fontSize:14 }}>✕</button>
+          <button onClick={() => driveConnect(false)} style={{ fontSize:11, padding:"3px 10px", border:"1px solid #f8717155", borderRadius:5, background:"rgba(239,68,68,.15)", color:"#f87171", cursor:"pointer" }}>Retry</button>
+          <button onClick={() => { setDriveStatus("disconnected"); setDriveMsg(""); localStorage.removeItem("sso_mgr_drive_connected"); }} style={{ border:"none", background:"none", color:"#475569", cursor:"pointer", fontSize:14 }}>✕</button>
         </div>
       )}
 
