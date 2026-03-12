@@ -1314,8 +1314,19 @@ mail - email address"
               </div>
             </div>
           </div>
-          <div style={{ padding:"4px 12px", borderBottom:"1px solid #1a1e2e" }}>
-            <span style={{ color:"#334155", fontSize:10, fontFamily:"'JetBrains Mono',monospace" }}>{visible.length}/{tickets.length} TICKETS</span>
+          <div style={{ padding:"6px 12px", borderBottom:"1px solid #1a1e2e", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+            <span style={{ color:"#334155", fontSize:10, fontFamily:"'JetBrains Mono',monospace" }}>
+              {visible.length === tickets.filter(t => t.state !== "Closed").length
+                ? <>{visible.length} <span style={{ color:"#2a2d3e" }}>TICKETS</span></>
+                : <><span style={{ color:"#60a5fa", fontWeight:700 }}>{visible.length}</span> <span style={{ color:"#2a2d3e" }}>of {tickets.filter(t => t.state !== "Closed").length} TICKETS</span></>
+              }
+            </span>
+            {(stateF !== "All" || assigneeF !== "All" || search || needsRespF || staleDays !== "") && (
+              <button onClick={() => { setStateF("All"); setAssigneeF("All"); setSearch(""); setNeedsRespF(false); setStaleDays(""); }}
+                style={{ fontSize:9, padding:"2px 7px", border:"1px solid #2a2d3e", borderRadius:4, background:"transparent", color:"#475569", cursor:"pointer", fontFamily:"monospace", letterSpacing:.4 }}>
+                CLEAR
+              </button>
+            )}
           </div>
           <div style={{ flex:1, overflowY:"auto" }}>
             {visible.map(t => {
