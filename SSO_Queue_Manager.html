@@ -242,6 +242,7 @@ const STATE_META = {
   "Pending":     { color:"#f59e0b", bg:"rgba(245,158,11,0.12)" },
   "In Progress": { color:"#10b981", bg:"rgba(16,185,129,0.12)" },
   "On Hold":     { color:"#8b5cf6", bg:"rgba(139,92,246,0.12)" },
+  "Closed":      { color:"#475569", bg:"rgba(71,85,105,0.12)"  },
 };
 
 const STORAGE_KEY         = "sso_mgr_v5";
@@ -612,13 +613,21 @@ function App() {
 
         const updated    = [];
         const newTickets = [];
+        const closed     = [];
 
         setTicketList(prev => {
-          const existing = prev.reduce((acc, t) => { acc[t.number] = t; return acc; }, {});
+          const incomingNums = new Set(incoming.map(i => i.number));
+
+          prev.forEach(old => {
+            if (old.state === "Closed") return; // already closed, skip
+            if (!incomingNums.has(old.number)) {
+              closed.push({ ...old, changes: [`Closed — not present in new export`] });
+            }
+          });
 
           incoming.forEach(inc => {
-            if (existing[inc.number]) {
-              const old = existing[inc.number];
+            const old = prev.find(t => t.number === inc.number);
+            if (old) {
               const changes = [];
               if (inc.state    !== old.state)    changes.push(`State: ${old.state} → ${inc.state}`);
               if (inc.assignee !== old.assignee) changes.push(`Assignee: ${old.assignee} → ${inc.assignee}`);
@@ -632,15 +641,19 @@ function App() {
             }
           });
 
-          // Build new ticket list: merge updates into existing, append new ones
+          // Build merged list: apply updates, close missing, append new
+          const closedDate = new Date().toISOString().slice(0,10);
           const merged = prev.map(t => {
             const upd = incoming.find(i => i.number === t.number);
-            return upd ? { ...t, ...upd } : t;
+            if (upd) return { ...t, ...upd };
+            if (t.state !== "Closed" && !incomingNums.has(t.number)) {
+              return { ...t, state: "Closed", closedAt: closedDate };
+            }
+            return t;
           });
           const existingNums = new Set(prev.map(t => t.number));
           newTickets.forEach(nt => { if (!existingNums.has(nt.number)) merged.push(nt); });
 
-          // Also ensure meta has entries for new tickets
           if (newTickets.length > 0) {
             setMeta(m => {
               const nm = { ...m };
@@ -654,7 +667,7 @@ function App() {
           return merged;
         });
 
-        setDiffResult({ updated, newTickets, uploadedAt: new Date().toLocaleString(), fileName: file.name });
+        setDiffResult({ updated, newTickets, closed, uploadedAt: new Date().toLocaleString(), fileName: file.name });
       } catch (err) {
         alert("Could not parse Excel file: " + err.message);
       }
@@ -715,6 +728,7 @@ function App() {
   const tickets = ticketList.map(t => ({ ...t, m: meta[t.number] || blankMeta() }));
 
   const visible = tickets.filter(t => {
+    if (stateF === "All" && t.state === "Closed") return false; // closed hidden by default
     if (stateF    !== "All" && t.state    !== stateF)    return false;
     if (assigneeF !== "All" && t.assignee !== assigneeF) return false;
     if (search && !t.desc.toLowerCase().includes(search.toLowerCase()) &&
@@ -1122,6 +1136,13 @@ mail - email address"
             </div>
           );
         })}
+        {tickets.filter(t => t.state === "Closed").length > 0 && (
+          <div onClick={() => setStateF(f => f==="Closed" ? "All" : "Closed")}
+            style={{ cursor:"pointer", display:"flex", alignItems:"center", gap:4, opacity: stateF!=="All"&&stateF!=="Closed" ? 0.3 : 0.6, transition:"opacity .2s" }}>
+            <span style={{ color:"#475569", fontFamily:"'JetBrains Mono',monospace", fontSize:15, fontWeight:700 }}>{tickets.filter(t => t.state==="Closed").length}</span>
+            <span style={{ color:"#334155", fontSize:10, fontFamily:"'JetBrains Mono',monospace" }}>CLOSED</span>
+          </div>
+        )}
         <div style={{ width:"1px", height:20, background:"#2a2d3e" }} />
         {/* Import saved progress */}
         <input ref={importRef} type="file" accept=".json" style={{ display:"none" }} onChange={handleImportJSON} />
@@ -1218,7 +1239,7 @@ mail - email address"
       )}
 
       {/* Diff banner */}
-      {diffResult && (diffResult.updated.length > 0 || diffResult.newTickets.length > 0) && (
+      {diffResult && (diffResult.updated.length > 0 || diffResult.newTickets.length > 0 || diffResult.closed?.length > 0) && (
         <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", padding:"10px 20px", display:"flex", gap:16, alignItems:"flex-start", flexWrap:"wrap" }}>
           <div style={{ flex:1 }}>
             <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:6, flexWrap:"wrap" }}>
@@ -1233,6 +1254,11 @@ mail - email address"
                   🔄 {diffResult.updated.length} updated
                 </span>
               )}
+              {diffResult.closed?.length > 0 && (
+                <span style={{ fontSize:11, padding:"2px 9px", borderRadius:10, background:"rgba(71,85,105,.2)", color:"#94a3b8", border:"1px solid rgba(71,85,105,.4)" }}>
+                  ✓ {diffResult.closed.length} closed
+                </span>
+              )}
             </div>
             <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
               {diffResult.newTickets.map(t => (
@@ -1243,6 +1269,11 @@ mail - email address"
               {diffResult.updated.map(t => (
                 <div key={t.number} title={t.changes.join("\n")} style={{ fontSize:11, padding:"3px 9px", background:"rgba(245,158,11,.08)", border:"1px solid rgba(245,158,11,.25)", borderRadius:6, color:"#fbbf24", cursor:"help" }}>
                   🔄 {t.number} — {t.changes[0]}{t.changes.length>1?` +${t.changes.length-1} more`:""}
+                </div>
+              ))}
+              {diffResult.closed?.map(t => (
+                <div key={t.number} title="Not present in new export — marked Closed" style={{ fontSize:11, padding:"3px 9px", background:"rgba(71,85,105,.08)", border:"1px solid rgba(71,85,105,.3)", borderRadius:6, color:"#94a3b8", cursor:"help" }}>
+                  ✓ {t.number} — {t.desc.slice(0,40)}{t.desc.length>40?"…":""}
                 </div>
               ))}
             </div>
@@ -1261,7 +1292,7 @@ mail - email address"
             <div style={{ display:"flex", gap:6 }}>
               <select value={stateF} onChange={e => setStateF(e.target.value)}
                 style={{ flex:1, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"5px 7px", color:"#94a3b8", fontSize:11, outline:"none" }}>
-                {["All","Open","Pending","In Progress","On Hold"].map(o => <option key={o}>{o}</option>)}
+                {["All","Open","Pending","In Progress","On Hold","Closed"].map(o => <option key={o}>{o}</option>)}
               </select>
               <select value={assigneeF} onChange={e => setAssigneeF(e.target.value)}
                 style={{ flex:1, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"5px 7px", color:"#94a3b8", fontSize:11, outline:"none" }}>
