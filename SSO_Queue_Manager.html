@@ -228,9 +228,9 @@ const RAW_TICKETS = [
 ];
 
 const WORKFLOW_STEPS = [
-  { id:"forms_exist",       label:"Forms exist?",                       icon:"📋", hint:"Check if Login Request and/or Confidentiality Form are attached." },
-  { id:"login_form",        label:"Login Request Form received",        icon:"📄", hint:"Emory Login Request Form attached to ticket.", dependsOn:"forms_exist" },
-  { id:"conf_form",         label:"Confidentiality Form received",      icon:"🔒", hint:"Emory Confidentiality Form attached to ticket.", dependsOn:"forms_exist" },
+  { id:"Initial_Message_Sent",       label:"Initial Message Sent?",                       icon:"📋", hint:"Check if Login Request and/or Confidentiality Form are attached." },
+  { id:"login_form",        label:"Login Request Form received",        icon:"📄", hint:"Emory Login Request Form attached to ticket.", dependsOn:"Initial_Message_Sent" },
+  { id:"conf_form",         label:"Confidentiality Form received",      icon:"🔒", hint:"Emory Confidentiality Form attached to ticket.", dependsOn:"Initial_Message_Sent" },
   { id:"security_review",   label:"Security review completed?",         icon:"🛡️", hint:"Has the application undergone a security review?" },
   { id:"forms_reviewed",    label:"Form review complete",               icon:"🔍", hint:"All questions answered — use Form Analysis tab." },
   { id:"steward_sent",      label:"Data Steward approval requested",    icon:"📨", hint:"Approval email sent to appropriate data steward(s)." },
@@ -729,7 +729,7 @@ function App() {
     patch(num, { workflow: wf });
   };
 
-  const PCT_STEPS = ["forms_exist","login_form","conf_form","security_review","security_review_proof","forms_reviewed","steward_sent","steward_approved","handoff_to_gerry","implemented"];
+  const PCT_STEPS = ["Initial_Message_Sent","login_form","conf_form","security_review","security_review_proof","forms_reviewed","steward_sent","steward_approved","handoff_to_gerry","implemented"];
   const pct = (num) => {
     const wf = meta[num]?.workflow || {};
     return Math.round(PCT_STEPS.filter(s => wf[s]).length / PCT_STEPS.length * 100);
@@ -1459,10 +1459,10 @@ mail - email address"
                       </div>
                     </div>
 
-                    {/* ── Forms exist? ── */}
+                    {/* ── Initial Message Sent? ── */}
                     {(() => {
                       const wf = sel.m.workflow || {};
-                      const formsExist    = wf.forms_exist;
+                      const formsExist    = wf.Initial_Message_Sent;
                       const loginForm     = wf.login_form;
                       const confForm      = wf.conf_form;
                       const secReview     = wf.security_review;
@@ -1493,12 +1493,12 @@ mail - email address"
 
                       return (
                         <>
-                          {/* Forms exist? */}
-                          <StepRow id="forms_exist" label="Forms exist?" icon="📋"
+                          {/* Initial Message Sent? */}
+                          <StepRow id="Initial_Message_Sent" label="Initial Message Sent?" icon="📋"
                             checked={formsExist}
-                            onClick={() => toggleStep(sel.number, "forms_exist")}>
+                            onClick={() => toggleStep(sel.number, "Initial_Message_Sent")}>
 
-                            {/* Sub-items: always show once forms_exist is toggled or forms are partially checked */}
+                            {/* Sub-items: always show once Initial_Message_Sent is toggled or forms are partially checked */}
                             <div style={{ marginLeft:24, marginTop:4, marginBottom:2 }}>
                               <StepRow id="login_form" label="Login Request Form received" icon="📄"
                                 checked={loginForm} dimmed={false}
