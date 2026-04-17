@@ -271,7 +271,7 @@ const loadTickets = () => { try { const s = localStorage.getItem(TICKETS_STORAGE
 const saveTickets = (t) => { try { localStorage.setItem(TICKETS_STORAGE_KEY, JSON.stringify(t)); } catch {} };
 const loadApiKey = () => { try { return localStorage.getItem(API_KEY_STORAGE) || ""; } catch { return ""; } };
 const saveApiKey = (k) => { try { localStorage.setItem(API_KEY_STORAGE, k); } catch {} };
-const blankMeta = () => ({ workflow:{}, followUp:"", priority:"Normal", note:"", formAnalysis:null, finalAttributes:"", finalAudience:[], ssoin:{}, commentDraft:"" });
+const blankMeta = () => ({ workflow:{}, followUp:"", priority:"Normal", note:"", formAnalysis:null, finalAttributes:"", finalAudience:[], ssoin:{}, commentDraft:"", qaLog:[] });
 
 async function readAsBase64(file) {
   return new Promise((res, rej) => {
@@ -312,6 +312,54 @@ async function claudeCall(messages, system, apiKey) {
 }
 
 const ANALYSIS_SYSTEM = `You are an SSO/Shibboleth administrator at Emory University OIT Cybersecurity Architecture. You review Login Request Forms. Respond ONLY with valid JSON inside a json code block — no prose outside it.`;
+
+const QA_SYSTEM = `You are an SSO/Shibboleth administrator at Emory University OIT Cybersecurity Architecture.
+You parse email/message text containing answers to SSO integration follow-up questions.
+Extract each distinct question-answer pair. Identify what workflow condition each answer resolves.
+Respond ONLY with valid JSON in a json code block — no prose outside it.`;
+
+// Maps text patterns → workflow step they resolve when answered satisfactorily
+const FLAG_MAP = [
+  { key:"saml",     patterns:["saml 2.0","saml2","saml support","saml is supported","supports saml"],       step:"forms_reviewed",   ssoinKey:"authentication_protocol", ssoinVal:(ans) => "SAML 2.0", label:"SAML 2.0 confirmed" },
+  { key:"ppid",     patterns:["ppid","serialnumber","public person id","identifier","email is required"],    step:"forms_reviewed",   ssoinKey:"application_primary_identifier", ssoinVal:(ans) => ans.toLowerCase().includes("email") ? "Email (mail)" : "SerialNumber (PPID)", label:"Primary identifier confirmed" },
+  { key:"access",   patterns:["access","authorization","who will have access","how will access","rbac"],     step:"forms_reviewed",   ssoinKey:"authorization_method", ssoinVal:(ans) => ans.slice(0,200), label:"Access/authorization clarified" },
+  { key:"security", patterns:["security review","security form","oit security","security questionnaire"],    step:"security_review",  ssoinKey:null, ssoinVal:null, label:"Security review addressed" },
+  { key:"steward",  patterns:["approve","approved","do you approve","steward approval","attribute approval"], step:"steward_approved", ssoinKey:null, ssoinVal:null, label:"Data steward approved" },
+  { key:"forms",    patterns:["login request form","confidentiality form","forms attached","form attached"],  step:"login_form",       ssoinKey:null, ssoinVal:null, label:"Forms received" },
+];
+
+// Apply resolved QA entries to workflow + ssoin fields, return { wf, ssoin, autoAdvanced }
+function applyResolvedQA(qaLog, existingWf, existingSsoin) {
+  const wf    = { ...existingWf };
+  const ssoin = { ...existingSsoin };
+  const autoAdvanced = [];
+
+  for (const entry of (qaLog || [])) {
+    if (!entry.resolved) continue;
+    const text = ((entry.question || "") + " " + (entry.answer || "")).toLowerCase();
+    for (const fm of FLAG_MAP) {
+      if (fm.patterns.some(p => text.includes(p))) {
+        if (!wf[fm.step]) {
+          wf[fm.step] = true;
+          autoAdvanced.push(fm.label);
+        }
+        // Also auto-populate ssoin field if applicable
+        if (fm.ssoinKey && fm.ssoinVal && !ssoin[fm.ssoinKey]) {
+          ssoin[fm.ssoinKey] = fm.ssoinVal(entry.answer || "");
+        }
+        // Special: if security review resolved, also set proof
+        if (fm.key === "security" && entry.answer?.toLowerCase().includes("attach")) {
+          wf["security_review_proof"] = true;
+        }
+        // Special: if forms resolved, set both login_form and conf_form
+        if (fm.key === "forms") {
+          wf["conf_form"] = true;
+        }
+      }
+    }
+  }
+  return { wf, ssoin, autoAdvanced };
+}
 
 // ── Report generation (Excel via SheetJS) ────────────────────────────────────
 function generateReport(tickets, meta, pctFn) {
@@ -526,6 +574,10 @@ function App() {
   const [triageMode, setTriageMode]   = useState(false);
   const [showReport, setShowReport] = useState(false);
   const [metaBusy,   setMetaBusy]  = useState(false);
+  const [qaBusy,      setQaBusy]     = useState(false);
+  const [qaPaste,     setQaPaste]    = useState("");
+  const [qaResponder, setQaResponder] = useState("");
+  const [qaMsg,       setQaMsg]      = useState(null); // { type:"success"|"info"|"error", text, advanced:[] }
   const [driveStatus, setDriveStatus] = useState("disconnected");
   const [driveMsg,    setDriveMsg]    = useState("");
   const [apiKey,      setApiKey]      = useState(() => loadApiKey());
@@ -924,6 +976,101 @@ Flag rules:
     }
   }
 
+  // ── Parse pasted text OR comments into Q&A log entries ──────────────────
+  async function parseQAText(rawText, responder, sourceLabel) {
+    if (!rawText.trim()) return;
+    setQaBusy(true); setQaMsg(null);
+    try {
+      const prompt = `Parse this text containing answers to SSO integration follow-up questions.
+Extract each distinct question-answer pair. The responder is: "${responder || "Unknown"}".
+Source context: ${sourceLabel}
+
+Text to parse:
+---
+${rawText}
+---
+
+Return ONLY a JSON object in a \`\`\`json block:
+{
+  "entries": [
+    {
+      "question": "the question being answered (infer from context if not explicit)",
+      "answer": "the full answer text",
+      "resolved": true or false (true = question is fully answered and actionable),
+      "autoAdvance": ["list of workflow items this resolves: saml | ppid | access | security | steward | forms"],
+      "ssoinUpdates": { "field_key": "value" }
+    }
+  ],
+  "summary": "one sentence summary of what was resolved"
+}
+
+For autoAdvance, use these keys when the answer clearly resolves that item:
+- saml: SAML 2.0 support confirmed
+- ppid: Primary identifier confirmed (note if email/other is required instead of PPID)
+- access: Authorization/access control method clarified
+- security: Security review status addressed (sent, attached, in progress, etc.)
+- steward: Data steward has approved attribute release
+- forms: Login Request Form and/or Confidentiality Form attached`;
+
+      const raw = await claudeCall([{ role:"user", content:prompt }], QA_SYSTEM, apiKey);
+      const match = raw.match(/\`\`\`json\s*([\s\S]*?)\`\`\`/) || raw.match(/(\{[\s\S]*\})/);
+      if (!match) throw new Error("Could not parse AI response");
+      const parsed = JSON.parse(match[1]);
+
+      const now = new Date().toISOString();
+      const newEntries = (parsed.entries || []).map((e, i) => ({
+        id: now + "_" + i,
+        question:   e.question   || "",
+        answer:     e.answer     || "",
+        resolved:   e.resolved   ?? true,
+        responder:  responder    || "Unknown",
+        source:     sourceLabel  || "Pasted text",
+        date:       new Date().toLocaleDateString(),
+        autoAdvance: e.autoAdvance || [],
+      }));
+
+      if (newEntries.length === 0) {
+        setQaMsg({ type:"info", text:"No Q&A pairs found in that text.", advanced:[] });
+        setQaBusy(false); return;
+      }
+
+      // Merge with existing log (avoid duplicates by question similarity)
+      const existing = sel.m.qaLog || [];
+      const merged = [...existing];
+      for (const ne of newEntries) {
+        const isDupe = existing.some(e =>
+          e.question.toLowerCase().slice(0,40) === ne.question.toLowerCase().slice(0,40)
+        );
+        if (!isDupe) merged.push(ne);
+      }
+
+      // Apply resolved entries to workflow + ssoin
+      const currentWf    = sel.m.workflow || {};
+      const currentSsoin = sel.m.ssoin    || {};
+      const { wf: newWf, ssoin: newSsoin, autoAdvanced } = applyResolvedQA(merged, currentWf, currentSsoin);
+
+      patch(sel.number, { qaLog: merged, workflow: newWf, ssoin: newSsoin });
+      setQaPaste("");
+      setQaMsg({
+        type: "success",
+        text: `Parsed ${newEntries.length} response${newEntries.length>1?"s":""}.${parsed.summary ? " " + parsed.summary : ""}`,
+        advanced: autoAdvanced,
+      });
+    } catch(e) {
+      setQaMsg({ type:"error", text: e.message === "NO_API_KEY" ? "No API key set — click 🔑 Key in the top bar." : "Parse error: " + e.message, advanced:[] });
+    }
+    setQaBusy(false);
+  }
+
+  // Parse the ticket's existing ServiceNow comments for QA responses
+  async function parseCommentsForQA() {
+    if (!sel?.comments?.trim()) {
+      setQaMsg({ type:"info", text:"No comments in this snapshot to parse.", advanced:[] });
+      return;
+    }
+    await parseQAText(sel.comments, "from comments", "ServiceNow comment snapshot");
+  }
+
   async function genDraft(type) {
     if (!sel) return;
     setAiDraft({ text:"", loading:true, type }); setTab("draft");
@@ -1046,11 +1193,17 @@ Format requirements:
           s.implementation_notes     && `Notes: ${s.implementation_notes}`,
         ].filter(Boolean).join("\n");
 
+        const qaResolved = (sel.m.qaLog || []).filter(e => e.resolved);
+        const qaContext = qaResolved.length > 0
+          ? "\n\nConfirmed details from vendor/requester Q&A:\n" +
+            qaResolved.map(e => `- ${e.question.trim()}: ${e.answer.trim()}`).join("\n")
+          : "";
+
         return `Generate a concise ServiceNow ticket comment from OIT Cybersecurity Architecture to Gerry Hall (GHALL4) handing off an approved SSO request for implementation.
 
 Ticket: ${sel.number} — ${sel.desc}
 
-${fields}
+${fields}${qaContext}
 
 Approved attributes to release:
 ${attrLines || "(see attributes above)"}
@@ -1438,7 +1591,7 @@ mail - email address"
 
             {/* Tabs */}
             <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", padding:"0 22px", display:"flex" }}>
-              {[["workflow","⚡ Workflow"],["form","📄 Form Analysis"],["draft","✉️ Drafts"],["notes","📝 Notes"],["comments","💬 Comments"]].map(([id,label]) => {
+              {[["workflow","⚡ Workflow"],["form","📄 Form Analysis"],["draft","✉️ Drafts"],["responses","📬 Responses"],["notes","📝 Notes"],["comments","💬 Comments"]].map(([id,label]) => {
                 const fa = sel.m.formAnalysis;
                 return (
                   <button key={id} className="tbtn" onClick={() => setTab(id)}
@@ -1446,6 +1599,7 @@ mail - email address"
                     {label}
                     {id==="form" && fa && <span style={{ marginLeft:5, fontSize:9, background:"#10b981", color:"white", borderRadius:8, padding:"1px 5px" }}>✓</span>}
                     {id==="form" && fa?.flags?.length>0 && <span style={{ marginLeft:3, fontSize:9, background:"#ef4444", color:"white", borderRadius:8, padding:"1px 5px" }}>{fa.flags.length}</span>}
+                    {id==="responses" && (sel.m.qaLog||[]).length > 0 && <span style={{ marginLeft:5, fontSize:9, background:"#8b5cf6", color:"white", borderRadius:8, padding:"1px 5px" }}>{(sel.m.qaLog||[]).length}</span>}
                   </button>
                 );
               })}
@@ -1932,6 +2086,148 @@ mail - email address"
                   )}
                 </div>
               )}
+
+              {/* RESPONSES */}
+              {tab==="responses" && (() => {
+                const qaLog = sel.m.qaLog || [];
+                const resolved = qaLog.filter(e => e.resolved);
+                const pending  = qaLog.filter(e => !e.resolved);
+                return (
+                <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+
+                  {/* Auto-parse banner */}
+                  {qaMsg && (
+                    <div style={{ padding:"10px 14px", borderRadius:8, background:qaMsg.type==="success"?"rgba(16,185,129,.1)":qaMsg.type==="error"?"rgba(239,68,68,.1)":"rgba(96,165,250,.1)", border:`1px solid ${qaMsg.type==="success"?"rgba(16,185,129,.3)":qaMsg.type==="error"?"rgba(239,68,68,.3)":"rgba(96,165,250,.3)"}`, display:"flex", flexDirection:"column", gap:6 }}>
+                      <div style={{ fontSize:13, color:qaMsg.type==="success"?"#34d399":qaMsg.type==="error"?"#f87171":"#60a5fa" }}>{qaMsg.type==="success"?"✓":qaMsg.type==="error"?"⚠":"ℹ"} {qaMsg.text}</div>
+                      {qaMsg.advanced?.length > 0 && (
+                        <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
+                          {qaMsg.advanced.map((a,i) => (
+                            <span key={i} style={{ fontSize:10, padding:"2px 8px", borderRadius:10, background:"rgba(16,185,129,.2)", color:"#34d399", border:"1px solid rgba(16,185,129,.3)" }}>⚡ Auto-advanced: {a}</span>
+                          ))}
+                        </div>
+                      )}
+                      <button onClick={() => setQaMsg(null)} style={{ alignSelf:"flex-end", border:"none", background:"none", color:"#475569", cursor:"pointer", fontSize:11 }}>Dismiss</button>
+                    </div>
+                  )}
+
+                  {/* Parse from comments button */}
+                  <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:16 }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+                      <h3 style={{ margin:0, color:"#e2e8f0", fontSize:14, fontWeight:600 }}>📬 Response Log</h3>
+                      <div style={{ display:"flex", gap:7 }}>
+                        <button onClick={parseCommentsForQA} disabled={qaBusy || !sel.comments?.trim()}
+                          title={!sel.comments?.trim() ? "No comments in snapshot" : "Scan existing ServiceNow comments for Q&A responses"}
+                          style={{ fontSize:11, padding:"5px 12px", border:"1px solid #60a5fa44", borderRadius:6, background:"rgba(96,165,250,.08)", color:(!sel.comments?.trim())?"#334155":"#60a5fa", cursor:(!sel.comments?.trim())?"not-allowed":"pointer", opacity:(!sel.comments?.trim())?0.5:1 }}>
+                          {qaBusy ? "⟳ Parsing…" : "🔍 Scan comments"}
+                        </button>
+                        {qaLog.length > 0 && (
+                          <button onClick={() => { if(window.confirm("Clear all Q&A log entries for this ticket?")) patch(sel.number, { qaLog:[] }); }}
+                            style={{ fontSize:11, padding:"5px 10px", border:"1px solid #f8717144", borderRadius:6, background:"rgba(239,68,68,.06)", color:"#f87171", cursor:"pointer" }}>
+                            Clear all
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {qaLog.length === 0 ? (
+                      <div style={{ textAlign:"center", padding:"24px 0", color:"#334155" }}>
+                        <div style={{ fontSize:24, marginBottom:6 }}>📭</div>
+                        <div style={{ fontSize:13 }}>No responses logged yet.</div>
+                        <div style={{ fontSize:11, color:"#2a3448", marginTop:4 }}>Scan comments or paste a response below.</div>
+                      </div>
+                    ) : (
+                      <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+                        {qaLog.map((entry, i) => (
+                          <div key={entry.id || i} style={{ background:"#0f1117", border:`1px solid ${entry.resolved?"rgba(16,185,129,.25)":"rgba(245,158,11,.25)"}`, borderRadius:8, padding:12 }}>
+                            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:6, gap:8 }}>
+                              <div style={{ flex:1 }}>
+                                <div style={{ fontSize:12, color:"#94a3b8", fontWeight:600, marginBottom:3 }}>Q: {entry.question}</div>
+                                <div style={{ fontSize:13, color:"#e2e8f0", lineHeight:1.5 }}>A: {entry.answer}</div>
+                              </div>
+                              <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:4, flexShrink:0 }}>
+                                <span style={{ fontSize:9, padding:"2px 7px", borderRadius:10, background:entry.resolved?"rgba(16,185,129,.2)":"rgba(245,158,11,.2)", color:entry.resolved?"#34d399":"#fbbf24", border:`1px solid ${entry.resolved?"rgba(16,185,129,.3)":"rgba(245,158,11,.3)"}`, fontWeight:700 }}>
+                                  {entry.resolved ? "✓ RESOLVED" : "⏳ PENDING"}
+                                </span>
+                                <button onClick={() => {
+                                  const updated = qaLog.map((e,j) => j===i ? {...e, resolved:!e.resolved} : e);
+                                  const {wf: newWf, ssoin: newSsoin, autoAdvanced} = applyResolvedQA(updated, sel.m.workflow||{}, sel.m.ssoin||{});
+                                  patch(sel.number, { qaLog:updated, workflow:newWf, ssoin:newSsoin });
+                                  if (autoAdvanced.length) setQaMsg({ type:"success", text:"Workflow updated.", advanced:autoAdvanced });
+                                }} style={{ fontSize:9, padding:"2px 7px", border:"1px solid #2a2d3e", borderRadius:4, background:"transparent", color:"#475569", cursor:"pointer" }}>
+                                  Toggle
+                                </button>
+                              </div>
+                            </div>
+                            <div style={{ display:"flex", gap:10, fontSize:10, color:"#334155", flexWrap:"wrap" }}>
+                              <span>👤 {entry.responder}</span>
+                              <span>📅 {entry.date}</span>
+                              <span>📥 {entry.source}</span>
+                            </div>
+                            {/* Edit fields inline */}
+                            <div style={{ marginTop:8, display:"flex", gap:6 }}>
+                              <input value={entry.responder} onChange={e => {
+                                const updated = qaLog.map((en,j) => j===i ? {...en, responder:e.target.value} : en);
+                                patch(sel.number, { qaLog:updated });
+                              }} placeholder="Responder name" style={{ flex:1, background:"#141720", border:"1px solid #2a2d3e", borderRadius:5, padding:"4px 8px", color:"#94a3b8", fontSize:11, outline:"none" }} />
+                              <button onClick={() => {
+                                const updated = qaLog.filter((_,j) => j !== i);
+                                patch(sel.number, { qaLog:updated });
+                              }} style={{ fontSize:10, padding:"4px 8px", border:"1px solid #f8717133", borderRadius:5, background:"transparent", color:"#f87171", cursor:"pointer" }}>Remove</button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Paste new response */}
+                  <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2563eb33", padding:16 }}>
+                    <h3 style={{ margin:"0 0 10px", color:"#e2e8f0", fontSize:14, fontWeight:600 }}>✏️ Paste Email / Message Response</h3>
+                    <div style={{ marginBottom:8 }}>
+                      <div style={{ fontSize:11, color:"#475569", marginBottom:4 }}>Responder name</div>
+                      <input value={qaResponder} onChange={e => setQaResponder(e.target.value)}
+                        placeholder="e.g. Jimmy Nguyen (DigitalPulp) or Dalong Wang"
+                        style={{ width:"100%", background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"7px 10px", color:"#e2e8f0", fontSize:12, outline:"none" }} />
+                    </div>
+                    <div style={{ marginBottom:10 }}>
+                      <div style={{ fontSize:11, color:"#475569", marginBottom:4 }}>Paste response text</div>
+                      <textarea value={qaPaste} onChange={e => setQaPaste(e.target.value)}
+                        placeholder={"Paste the email body or message here...\n\nExamples:\n• SAML 2.0 is supported.\n• Email is required, we cannot use PPID.\n• Security review form has been attached.\n• Approved. — Peter Buch"}
+                        style={{ width:"100%", minHeight:140, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:7, padding:"10px 12px", color:"#cbd5e1", fontSize:13, lineHeight:1.65, resize:"vertical", outline:"none" }} />
+                    </div>
+                    <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                      <button onClick={() => parseQAText(qaPaste, qaResponder, "Pasted email/message")}
+                        disabled={qaBusy || !qaPaste.trim()}
+                        style={{ padding:"8px 18px", border:"1px solid #60a5fa55", borderRadius:7, background:"rgba(96,165,250,.1)", color:qaPaste.trim()?"#60a5fa":"#334155", cursor:qaPaste.trim()?"pointer":"not-allowed", fontSize:13, fontWeight:600 }}>
+                        {qaBusy ? "⟳ Parsing…" : "Parse & Log Response"}
+                      </button>
+
+                      <span style={{ fontSize:10, color:"#334155", marginLeft:"auto" }}>Claude will extract Q&A pairs and auto-advance workflow</span>
+                    </div>
+                  </div>
+
+                  {/* Summary of what's resolved vs pending */}
+                  {qaLog.length > 0 && (
+                    <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:14, display:"flex", gap:14 }}>
+                      <div style={{ flex:1, textAlign:"center" }}>
+                        <div style={{ fontSize:22, fontWeight:700, color:"#34d399" }}>{resolved.length}</div>
+                        <div style={{ fontSize:10, color:"#34d399", fontFamily:"monospace" }}>RESOLVED</div>
+                      </div>
+                      <div style={{ width:1, background:"#2a2d3e" }} />
+                      <div style={{ flex:1, textAlign:"center" }}>
+                        <div style={{ fontSize:22, fontWeight:700, color:"#fbbf24" }}>{pending.length}</div>
+                        <div style={{ fontSize:10, color:"#fbbf24", fontFamily:"monospace" }}>PENDING</div>
+                      </div>
+                      <div style={{ width:1, background:"#2a2d3e" }} />
+                      <div style={{ flex:1, textAlign:"center" }}>
+                        <div style={{ fontSize:22, fontWeight:700, color:"#60a5fa" }}>{qaLog.length}</div>
+                        <div style={{ fontSize:10, color:"#60a5fa", fontFamily:"monospace" }}>TOTAL</div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+                );
+              })()}
 
               {/* NOTES */}
               {tab==="notes" && (
