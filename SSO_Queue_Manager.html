@@ -1027,7 +1027,8 @@ Flag rules:
         accessStr,
         vendorStr,
       ].filter(Boolean).join(" ").trim();
-      overwrite("application_description", enriched);
+      // Use set() so manual edits to the description survive re-analysis
+      set("application_description", enriched);
     }
     overwrite("entityid",                          analysis.entityId);
     overwrite("test_url",                          analysis.testUrl);
@@ -1039,32 +1040,37 @@ Flag rules:
     overwrite("application_business_owner_netid",  analysis.emoryContactNetId);
     overwrite("application_technical_owner_name",  analysis.supervisorName);
     overwrite("application_technical_owner_netid", analysis.supervisorNetId);
-    overwrite("authorization_method",              analysis.accessLimitation);
+    // ── Fields that should NOT overwrite values refined through Q&A / comments ──
+    // Use set() so these only fill in if currently empty.
+    // attributes_released, authorization_method, authentication_protocol:
+    // may have been updated from vendor responses, steward approval, or manual entry.
+    set("authorization_method",   analysis.accessLimitation);
     if (analysis.attributes?.length)
-      overwrite("attributes_released", analysis.attributes.join("\n"));
-    // Protocol — use exact value from form (SAML2 or OIDC), fallback to supportsSAML
+      set("attributes_released", analysis.attributes.join("\n"));
+    // Protocol — only fill if empty (may have been confirmed/corrected via Q&A)
     if (analysis.authProtocol && analysis.authProtocol !== "Not specified")
-      overwrite("authentication_protocol", analysis.authProtocol);
+      set("authentication_protocol", analysis.authProtocol);
     else if (analysis.supportsSAML === "Yes")
       set("authentication_protocol", "SAML2");
-    // Identifier — PPID from form
+    // Identifier — only fill if empty (confirmed via Q&A responses)
     if (analysis.hasPPID)
       set("application_primary_identifier", "SerialNumber (PPID)");
-    // Security review — use TRUE/FALSE
+    // Security review — only set FALSE from form; TRUE may come from comments/responses
+    // (don't overwrite TRUE with FALSE if we already confirmed it via comments)
     if (analysis.securityReview === "Completed")
-      overwrite("application_had_security_review", "TRUE");
-    else if (analysis.securityReview === "Not completed")
+      set("application_had_security_review", "TRUE");
+    else if (analysis.securityReview === "Not completed" && existing.application_had_security_review !== "TRUE")
       set("application_had_security_review", "FALSE");
-    // InCommon member
+
+    // ── Fields that are purely structural from the form — safe to always overwrite ──
+    // InCommon, sensitive data, enterprise auth, audience — only the form has this info
     if (analysis.incommonMember)
       overwrite("incommon_member", analysis.incommonMember);
-    // Sensitive data
     if (analysis.sensitivData)
       overwrite("application_sensitive_data", analysis.sensitivData);
-    // Enterprise authentication
     if (analysis.enterpriseAuth)
       set("enterprise_authentication", analysis.enterpriseAuth);
-    // Individual audience booleans (TRUE/FALSE) from new form fields
+    // Audience booleans — overwrite from form (authoritative source for audience)
     if (analysis.audienceEuvStaff)     overwrite("is_audience_euv_staff",     analysis.audienceEuvStaff);
     if (analysis.audienceEuvFaculty)   overwrite("is_audience_euv_faculty",   analysis.audienceEuvFaculty);
     if (analysis.audienceEuvStudents)  overwrite("is_audience_euv_students",  analysis.audienceEuvStudents);
@@ -2445,8 +2451,12 @@ mail - email address"
                                   style={{ fontSize:11, padding:"3px 9px", border:"1px solid #f59e0b33", borderRadius:5, background:"rgba(245,158,11,.08)", color:"#f59e0b", cursor:"pointer" }}>
                                   🔄 Refresh from form
                                 </button>
-                                <button onClick={() => setTab("form")}
-                                  title="Go to Form Analysis tab to re-upload and re-analyze the form — picks up new fields like InCommon, audience booleans, and enterprise auth"
+                                <button onClick={() => {
+                                    setTab("form");
+                                    // After tab switch renders, auto-open file picker
+                                    setTimeout(() => fileRef.current?.click(), 80);
+                                  }}
+                                  title="Re-upload the form to re-run AI analysis — picks up InCommon, audience booleans, enterprise auth, and enriched description"
                                   style={{ fontSize:11, padding:"3px 9px", border:"1px solid #60a5fa33", borderRadius:5, background:"rgba(96,165,250,.08)", color:"#60a5fa", cursor:"pointer" }}>
                                   📄 Re-analyze form
                                 </button>
@@ -2598,15 +2608,23 @@ mail - email address"
                 const fa = sel.m.formAnalysis;
                 return (
                   <div>
-                    <div className="drop" onClick={() => fileRef.current?.click()} style={{ marginBottom:10 }}>
+                    <div className="drop" onClick={() => fileRef.current?.click()}
+                      style={{ marginBottom:10, borderColor: fa ? "#60a5fa55" : undefined, background: fa ? "rgba(96,165,250,.03)" : undefined }}>
                       <input ref={fileRef} type="file" accept=".pdf,.docx" style={{ display:"none" }} onChange={handleUpload} />
                       {formBusy
                         ? <div style={{ color:"#60a5fa" }}><div style={{ fontSize:20, marginBottom:6 }}>⟳</div><div style={{ fontSize:12 }}>Reading and analyzing form…</div></div>
-                        : <div>
-                            <div style={{ fontSize:24, marginBottom:5 }}>📄</div>
-                            <div style={{ color:"#94a3b8", fontSize:13 }}>{fa ? `Replace: ${fa.fileName}` : "Click to upload Login Request Form"}</div>
-                            <div style={{ color:"#334155", fontSize:11, marginTop:3 }}>Accepts PDF or DOCX · AI will analyze and auto-populate handoff fields</div>
-                          </div>
+                        : fa
+                          ? <div>
+                              <div style={{ fontSize:20, marginBottom:4 }}>🔄</div>
+                              <div style={{ color:"#60a5fa", fontSize:13, fontWeight:600 }}>Click to re-analyze form</div>
+                              <div style={{ color:"#475569", fontSize:11, marginTop:3 }}>Previously analyzed: <strong style={{ color:"#94a3b8" }}>{fa.fileName}</strong></div>
+                              <div style={{ color:"#334155", fontSize:11, marginTop:2 }}>Re-uploading will extract InCommon, audience, enterprise auth, and rebuild the enriched description</div>
+                            </div>
+                          : <div>
+                              <div style={{ fontSize:24, marginBottom:5 }}>📄</div>
+                              <div style={{ color:"#94a3b8", fontSize:13 }}>Click to upload Login Request Form</div>
+                              <div style={{ color:"#334155", fontSize:11, marginTop:3 }}>Accepts PDF or DOCX · AI will analyze and auto-populate handoff fields</div>
+                            </div>
                       }
                     </div>
 
