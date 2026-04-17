@@ -32,7 +32,6 @@ const GDRIVE_SCOPES    = "https://www.googleapis.com/auth/drive.file";
 const GDRIVE_FILE_NAME = "SSO_Queue_Data.json";
 const GDRIVE_MIME      = "application/json";
 
-// In-memory token (cleared on page close)
 let _gToken = null;
 let _gTokenExpiry = 0;
 
@@ -40,18 +39,16 @@ function gTokenValid() {
   return _gToken && Date.now() < _gTokenExpiry - 30000;
 }
 
-// GIS loaded via <script> in <head> — poll until ready
 function loadGIS() {
   return new Promise((resolve) => {
     if (window.google?.accounts?.oauth2) { resolve(); return; }
     const iv = setInterval(() => {
       if (window.google?.accounts?.oauth2) { clearInterval(iv); resolve(); }
     }, 100);
-    setTimeout(() => { clearInterval(iv); resolve(); }, 10000); // give up after 10s
+    setTimeout(() => { clearInterval(iv); resolve(); }, 10000);
   });
 }
 
-// Request token via GIS TokenClient (popup consent flow)
 function gAuthorize(silent = false) {
   return new Promise(async (resolve, reject) => {
     try { await loadGIS(); } catch(e) { reject(new Error("Failed to load Google auth library: " + e.message)); return; }
@@ -80,7 +77,6 @@ function gAuthorize(silent = false) {
           resolve(_gToken);
         },
       });
-      // silent=true skips the account picker if consent was already granted
       client.requestAccessToken({ prompt: silent ? "" : "select_account" });
     } catch (e) {
       if (!settled) { settled = true; clearTimeout(timeout); reject(e); }
@@ -88,7 +84,6 @@ function gAuthorize(silent = false) {
   });
 }
 
-// Find SSO_Queue_Data.json in Drive
 async function gFindFile(token) {
   const r = await fetch(
     `https://www.googleapis.com/drive/v3/files?q=name%3D'${GDRIVE_FILE_NAME}'+and+trashed%3Dfalse&fields=files(id,name,modifiedTime)&spaces=drive`,
@@ -98,7 +93,6 @@ async function gFindFile(token) {
   return d.files?.[0] || null;
 }
 
-// Load data from Drive
 async function gLoad(token) {
   const file = await gFindFile(token);
   if (!file) return null;
@@ -110,7 +104,6 @@ async function gLoad(token) {
   return await r.json();
 }
 
-// Save data to Drive (create or update)
 async function gSave(token, data) {
   const file   = await gFindFile(token);
   const body   = JSON.stringify(data);
@@ -137,7 +130,6 @@ const SNOW_BASE     = "https://emory.service-now.com";
 const SR_UNIVERSITY = "https://emory.service-now.com/sp?id=sc_cat_item&sys_id=b47af99493ad1250076cfb4e1dba1094&sysparm_category=545914f91bdac250792dc956624bcb18";
 const SR_HEALTHCARE = "https://emory.service-now.com/sp?id=sc_cat_item&sys_id=dc4b396447c9625003093e14846d436c&sysparm_category=545914f91bdac250792dc956624bcb18";
 
-// sys_id map extracted from ServiceNow SLA report (03/10/2026)
 const SYS_ID = {
   SCTASK0042265: "3e980d453bd3b290a808d441a3e45a9e",
   SCTASK0043407: "a5360898332bb2100cab10919e5c7b47",
@@ -153,16 +145,14 @@ const SYS_ID = {
   SCTASK0033345: "6923a9fe3bb83290a808d441a3e45ab5",
   SCTASK0040712: "ad2cbff63b327a50a808d441a3e45ac5",
   SCTASK0039682: "84791d3b2b623e10a724f518fe91bfcd",
-  INC0231198:    "ad2cbff63b327a50a808d441a3e45ac5", // uses sc_task.do
+  INC0231198:    "ad2cbff63b327a50a808d441a3e45ac5",
   INC0239439:    "f83ef3323b727a50a808d441a3e45a4b",
   INC0140763:    "28b16d2c2ba3aa9020e2fa34d891bf06",
   INC0179924:    "00ba7f5c3b74f610a808d441a3e45af2",
   INC0223460:    "b66cd1523b163a90a808d441a3e45af3",
   INC0239264:    "6475abb63b7a3a50a808d441a3e45af8",
-  // INC0223460 and INC0239264 sys_ids still needed
 };
 
-// Table overrides for tickets that don't follow the default INC=incident / SCTASK=sc_task pattern
 const SNOW_TABLE = {
   INC0231198: "sc_task.do",
 };
@@ -173,29 +163,28 @@ const snowUrl = (number) => {
   if (sysId) {
     return `${SNOW_BASE}/now/nav/ui/classic/params/target/${table}%3Fsys_id%3D${sysId}%26sysparm_stack%3D%26sysparm_view%3D`;
   }
-  // Fallback: search by number until sys_id is added
   return `${SNOW_BASE}/now/nav/ui/classic/params/target/${table}%3Fnumber%3D${number}`;
 };
 
-// Maps NetID → name fragments that appear in comment author lines
 const ASSIGNEE_NAMES = {
   JBURK22: ["Joel Burke", "Joel B"],
   GHALL4:  ["Gerry Hall", "Gerald Hall"],
   RATNAFU: ["Robel Atnafu", "Robel A"],
 };
 
-// Returns the name of the last commenter, or "" if no comments
+// ── FIX 3: Handle AM/PM timestamps and parenthetical role suffixes
+// Old format: "03/06 06:52 - Heidi Sarge: ..."
+// New format: "04/13/2026 11:07:49 AM - Jimmy Nguyen (Work notes): ..."
 function lastCommentAuthor(comments) {
   if (!comments?.trim()) return "";
   const lines = comments.trim().split("\n").filter(l => l.trim());
   for (let i = lines.length - 1; i >= 0; i--) {
-    const m = lines[i].match(/^[\d/]+ [\d:]+ - (.+?):/);
+    const m = lines[i].match(/^[\d/]+ [\d:]+(?:\s*[AP]M)? - (.+?)(?:\s*\([^)]*\))?:/);
     if (m) return m[1].trim();
   }
   return "";
 }
 
-// Returns true if the last comment was NOT made by the assignee
 function needsResponse(ticket) {
   if (!ticket.comments?.trim()) return false;
   const author   = lastCommentAuthor(ticket.comments);
@@ -304,10 +293,8 @@ function generateReport(tickets, meta, pctFn) {
 
   const wb = XLSX.utils.book_new();
 
-  // ── Helper: hex color → ARGB (SheetJS needs ARGB without #) ──
   const argb = hex => "FF" + hex.replace("#","");
 
-  // ── Column definitions ──
   const stepCols = WORKFLOW_STEPS.map(s => s.label);
   const headers  = [
     "Ticket #", "RITM", "Type", "Description", "Assignee", "State",
@@ -319,7 +306,6 @@ function generateReport(tickets, meta, pctFn) {
     "Priority", "Notes"
   ];
 
-  // ── Build rows ──
   const dataRows = tickets.map(t => {
     const m        = meta[t.number] || blankMeta();
     const wf       = m.workflow || {};
@@ -345,18 +331,14 @@ function generateReport(tickets, meta, pctFn) {
   const wsData = [headers, ...dataRows];
   const ws     = XLSX.utils.aoa_to_sheet(wsData);
 
-  // ── Column widths ──
   const colWidths = [
     14, 12, 12, 50, 10, 12, 11, 11, 8,
     ...WORKFLOW_STEPS.map(() => 14),
     8, 14, 18, 12, 14, 10, 10, 10, 40
   ];
   ws["!cols"] = colWidths.map(w => ({ wch: w }));
-
-  // ── Freeze top row ──
   ws["!freeze"] = { xSplit: 0, ySplit: 1 };
 
-  // ── Style helpers ──
   const styleCell = (cellRef, style) => {
     if (!ws[cellRef]) return;
     ws[cellRef].s = style;
@@ -369,24 +351,22 @@ function generateReport(tickets, meta, pctFn) {
     border: { bottom: { style: "thin", color: { rgb: "FF60a5fa" } } }
   };
 
-  // Apply header styles
   headers.forEach((_, ci) => {
     const ref = XLSX.utils.encode_cell({ r: 0, c: ci });
     styleCell(ref, headerStyle);
   });
 
-  // ── Per-row styling ──
-  const stepStartCol = 9; // index of first workflow step column
+  const stepStartCol = 9;
   const stepEndCol   = stepStartCol + WORKFLOW_STEPS.length - 1;
 
   dataRows.forEach((row, ri) => {
-    const rowIdx  = ri + 1; // 0-indexed, row 0 = header
+    const rowIdx  = ri + 1;
     const ticket  = tickets[ri];
     const m       = meta[ticket.number] || blankMeta();
     const wf      = m.workflow || {};
     const nr      = needsResponse(ticket);
     const fuOv    = m.followUp && new Date(m.followUp) <= new Date();
-    const rowBg   = ri % 2 === 0 ? "FFF0F4FF" : "FFFFFFFF"; // subtle alternating
+    const rowBg   = ri % 2 === 0 ? "FFF0F4FF" : "FFFFFFFF";
 
     headers.forEach((_, ci) => {
       const ref = XLSX.utils.encode_cell({ r: rowIdx, c: ci });
@@ -396,7 +376,6 @@ function generateReport(tickets, meta, pctFn) {
       let font  = { name: "Arial", sz: 10, color: { rgb: "FF1e293b" } };
       let align = { vertical: "center", wrapText: ci === 3 || ci === headers.length - 1 };
 
-      // Workflow step columns — Yes=green, No=red
       if (ci >= stepStartCol && ci <= stepEndCol) {
         const val = ws[ref].v;
         if (val === "Yes") {
@@ -409,7 +388,6 @@ function generateReport(tickets, meta, pctFn) {
         align = { ...align, horizontal: "center" };
       }
 
-      // State column — colour by state
       if (ci === 5) {
         const stateColors = {
           "Open":        { bg: "FFe0f2fe", fg: "FF0369a1" },
@@ -423,7 +401,6 @@ function generateReport(tickets, meta, pctFn) {
         align = { ...align, horizontal: "center" };
       }
 
-      // Needs Response — Yes = amber
       const nrCol = stepEndCol + 2;
       if (ci === nrCol && ws[ref].v === "Yes") {
         fill = { patternType: "solid", fgColor: { rgb: "FFfef3c7" } };
@@ -431,7 +408,6 @@ function generateReport(tickets, meta, pctFn) {
         align = { ...align, horizontal: "center" };
       }
 
-      // Follow-up Overdue — Yes = red
       const fuCol = stepEndCol + 6;
       if (ci === fuCol && ws[ref].v === "Yes") {
         fill = { patternType: "solid", fgColor: { rgb: "FFffe4e6" } };
@@ -439,7 +415,6 @@ function generateReport(tickets, meta, pctFn) {
         align = { ...align, horizontal: "center" };
       }
 
-      // Days Since Update — red if >7
       if (ci === 8 && typeof ws[ref].v === "number" && ws[ref].v > 7) {
         font = { ...font, color: { rgb: "FF9f1239" }, bold: true };
       }
@@ -452,7 +427,6 @@ function generateReport(tickets, meta, pctFn) {
 
   XLSX.utils.book_append_sheet(wb, ws, "SSO Queue Report");
 
-  // ── Summary sheet ──
   const summary = [
     ["SSO Queue Report"],
     [`Generated: ${new Date().toLocaleString()}`],
@@ -469,14 +443,12 @@ function generateReport(tickets, meta, pctFn) {
   wsSummary["!cols"] = [{ wch: 22 }, { wch: 10 }];
   XLSX.utils.book_append_sheet(wb, wsSummary, "Summary");
 
-  // ── Download ──
   XLSX.writeFile(wb, `SSO_Queue_Report_${new Date().toISOString().slice(0,10)}.xlsx`);
 }
 
 
 // ── Excel diff ───────────────────────────────────────────────────────────────
 function parseXlsxTickets(wb) {
-  // Try to find the right sheet
   const sheetName = wb.SheetNames[0];
   const ws = wb.Sheets[sheetName];
   const rows = XLSX.utils.sheet_to_json(ws, { defval:"" });
@@ -497,7 +469,6 @@ function App() {
   const [ticketList, setTicketList] = useState(() => {
     const saved = loadTickets();
     if (saved && saved.length > 0) {
-      // Merge saved tickets with RAW_TICKETS: saved wins, RAW adds any missing
       const savedNums = new Set(saved.map(t => t.number));
       const extras = RAW_TICKETS.filter(t => !savedNums.has(t.number));
       return [...saved, ...extras];
@@ -505,10 +476,12 @@ function App() {
     return RAW_TICKETS;
   });
 
+  // ── FIX 1a: Initialize meta for ALL tickets (RAW + any saved via XLSX upload)
   const [meta, setMeta] = useState(() => {
     const saved = loadMeta();
     const m = {};
-    RAW_TICKETS.forEach(t => { m[t.number] = { ...blankMeta(), ...(saved[t.number] || {}) }; });
+    const allNums = new Set([...RAW_TICKETS.map(t => t.number), ...Object.keys(saved)]);
+    allNums.forEach(num => { m[num] = { ...blankMeta(), ...(saved[num] || {}) }; });
     return m;
   });
 
@@ -526,8 +499,7 @@ function App() {
   const [diffResult, setDiffResult] = useState(null);
   const [showReport, setShowReport] = useState(false);
   const [metaBusy,   setMetaBusy]  = useState(false);
-  // Google Drive sync state
-  const [driveStatus, setDriveStatus] = useState("disconnected"); // disconnected | connecting | syncing | saved | error | no_client
+  const [driveStatus, setDriveStatus] = useState("disconnected");
   const [driveMsg,    setDriveMsg]    = useState("");
   const [apiKey,      setApiKey]      = useState(() => loadApiKey());
   const [showApiKey,  setShowApiKey]  = useState(false);
@@ -538,7 +510,6 @@ function App() {
   const xlsxRef       = useRef();
   const importRef     = useRef();
 
-  // ── Drive: connect + initial load ──
   async function driveConnect(silent = false) {
     setDriveStatus("connecting");
     setDriveMsg(silent ? "Reconnecting to Drive…" : "Opening Google sign-in popup…");
@@ -557,10 +528,13 @@ function App() {
             return merged;
           });
         }
+        // ── FIX 1c: Restore meta for ALL ticket keys stored in Drive
         setMeta(prev => {
           const merged = { ...prev };
-          RAW_TICKETS.forEach(t => {
-            if (remote[t.number]) merged[t.number] = { ...blankMeta(), ...remote[t.number] };
+          Object.keys(remote).forEach(key => {
+            if (key !== "_tickets" && remote[key] && typeof remote[key] === "object") {
+              merged[key] = { ...blankMeta(), ...remote[key] };
+            }
           });
           saveMeta(merged);
           return merged;
@@ -574,20 +548,18 @@ function App() {
     } catch (e) {
       setDriveStatus("error");
       setDriveMsg(silent ? "" : (e.message || "Auth failed"));
-      if (silent) setDriveStatus("disconnected"); // silent fail = just show Connect button, no error
+      if (silent) setDriveStatus("disconnected");
     }
   }
 
-  // ── Auto-reconnect silently on page load if previously connected ──
   useEffect(() => {
     if (localStorage.getItem("sso_mgr_drive_connected") === "1") {
       driveConnect(true);
     }
   }, []);
 
-  // ── Drive: debounced auto-save whenever meta or ticketList changes ──
   useEffect(() => {
-    if (!gTokenValid()) return; // not connected, skip Drive save
+    if (!gTokenValid()) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     setDriveStatus("syncing");
     saveTimerRef.current = setTimeout(async () => {
@@ -602,7 +574,6 @@ function App() {
     }, 2000);
   }, [meta, ticketList]);
 
-  // Load SheetJS once
   useEffect(() => {
     if (typeof XLSX === "undefined") {
       const s = document.createElement("script");
@@ -629,7 +600,7 @@ function App() {
           const incomingNums = new Set(incoming.map(i => i.number));
 
           prev.forEach(old => {
-            if (old.state === "Closed") return; // already closed, skip
+            if (old.state === "Closed") return;
             if (!incomingNums.has(old.number)) {
               closed.push({ ...old, changes: [`Closed — not present in new export`] });
             }
@@ -651,7 +622,6 @@ function App() {
             }
           });
 
-          // Build merged list: apply updates, close missing, append new
           const closedDate = new Date().toISOString().slice(0,10);
           const merged = prev.map(t => {
             const upd = incoming.find(i => i.number === t.number);
@@ -664,14 +634,13 @@ function App() {
           const existingNums = new Set(prev.map(t => t.number));
           newTickets.forEach(nt => { if (!existingNums.has(nt.number)) merged.push(nt); });
 
-          if (newTickets.length > 0) {
-            setMeta(m => {
-              const nm = { ...m };
-              newTickets.forEach(nt => { if (!nm[nt.number]) nm[nt.number] = blankMeta(); });
-              saveMeta(nm);
-              return nm;
-            });
-          }
+          // ── FIX 1b: Always ensure meta exists for every incoming ticket
+          setMeta(m => {
+            const nm = { ...m };
+            incoming.forEach(nt => { if (!nm[nt.number]) nm[nt.number] = blankMeta(); });
+            saveMeta(nm);
+            return nm;
+          });
 
           saveTickets(merged);
           return merged;
@@ -685,7 +654,6 @@ function App() {
     reader.readAsArrayBuffer(file);
   };
 
-  // ── Import saved progress from JSON (exported from localStorage) ──
   function handleImportJSON(e) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -694,11 +662,10 @@ function App() {
     reader.onload = (ev) => {
       try {
         const imported = JSON.parse(ev.target.result);
-        // Validate it looks like SSO queue data
         const keys = Object.keys(imported);
         const validKeys = keys.filter(k => k.startsWith("SCTASK") || k.startsWith("INC") || k.startsWith("RITM"));
         if (validKeys.length === 0) {
-          alert("This doesn\'t look like SSO Queue Manager data. Make sure you copied the right localStorage value.");
+          alert("This doesn't look like SSO Queue Manager data. Make sure you copied the right localStorage value.");
           return;
         }
         setMeta(prev => {
@@ -737,8 +704,14 @@ function App() {
 
   const tickets = ticketList.map(t => ({ ...t, m: meta[t.number] || blankMeta() }));
 
+  // ── FIX 2a: Fast lookup sets for inline diff highlighting
+  const diffNewNums     = new Set((diffResult?.newTickets || []).map(t => t.number));
+  const diffUpdatedNums = new Set((diffResult?.updated    || []).map(t => t.number));
+  const diffClosedNums  = new Set((diffResult?.closed     || []).map(t => t.number));
+  const diffChangesMap  = Object.fromEntries((diffResult?.updated || []).map(t => [t.number, t.changes]));
+
   const visible = tickets.filter(t => {
-    if (stateF === "All" && t.state === "Closed") return false; // closed hidden by default
+    if (stateF === "All" && t.state === "Closed") return false;
     if (stateF    !== "All" && t.state    !== stateF)    return false;
     if (assigneeF !== "All" && t.assignee !== assigneeF) return false;
     if (search && !t.desc.toLowerCase().includes(search.toLowerCase()) &&
@@ -748,7 +721,6 @@ function App() {
     return true;
   });
 
-  // Base filtered by everything EXCEPT state — drives the topbar counters so they reflect current filters
   const filteredBase = tickets.filter(t => {
     if (t.state === "Closed") return false;
     if (assigneeF !== "All" && t.assignee !== assigneeF) return false;
@@ -847,7 +819,6 @@ Flag rules:
       if (!match) throw new Error("Could not parse AI response. Please try again.");
       const analysis = JSON.parse(match[1]);
       patch(sel.number, { formAnalysis: { ...analysis, fileName: file.name, at: new Date().toISOString() } });
-      // Auto-populate handoff fields from form analysis if not already filled
       autoPopulateHandoff(sel.number, analysis);
       setFormBusy(false);
     } catch (err) {
@@ -873,10 +844,8 @@ Flag rules:
     if (analysis.vendor)              updates.vendor                       = analysis.vendor;
     if (analysis.vendorContact)       updates.vendor_contact_name          = analysis.vendorContact;
     if (analysis.vendorEmail)         updates.vendor_contact_email_address = analysis.vendorEmail;
-    // Emory Contact → Business Owner
     if (analysis.emoryContact)        updates.application_business_owner_name  = analysis.emoryContact;
     if (analysis.emoryContactNetId)   updates.application_business_owner_netid = analysis.emoryContactNetId;
-    // Supervisor → Technical Owner
     if (analysis.supervisorName)      updates.application_technical_owner_name  = analysis.supervisorName;
     if (analysis.supervisorNetId)     updates.application_technical_owner_netid = analysis.supervisorNetId;
     if (Object.keys(updates).length) {
@@ -885,7 +854,6 @@ Flag rules:
   }
 
   function forcePopulateOwners(num, analysis) {
-    // Always overwrite owner fields from latest form analysis
     const existing = meta[num]?.ssoin || {};
     const updates = {};
     if (analysis.emoryContact)      updates.application_business_owner_name  = analysis.emoryContact;
@@ -907,7 +875,6 @@ Flag rules:
     setMetaBusy(true); setFormErr("");
     try {
       const text = await file.text();
-      // Parse key fields from SAML metadata XML
       const entityIdMatch  = text.match(/entityID="([^"]+)"/);
       const acsMatch       = text.match(/AssertionConsumerService[^/]*Location="([^"]+)"/);
       const orgNameMatch   = text.match(/<(?:\w+:)?OrganizationName[^>]*>([^<]+)</);
@@ -938,7 +905,6 @@ Flag rules:
     const finalAttrs    = sel.m.finalAttributes?.trim();
     const finalAudience = sel.m.finalAudience || [];
 
-    // Build steward To: line from finalAudience or fall back to form analysis
     const STEWARD_MAP = {
       "University employees": "Peter Buch <pbuch@emory.edu>",
       "Healthcare employees": "Elizabeth Dangler Wilson <elizabeth.dangler@emoryhealthcare.org>",
@@ -954,7 +920,6 @@ Flag rules:
     const audience = finalAudience.length > 0 ? finalAudience.join(", ") : (fa?.audience?.join(", ") || "");
     const attrs = finalAttrs || fa?.attributes?.join(", ") || "";
 
-    // Subject line: "Shibboleth Attribute Approval - <App Name>"
     const subject = `Shibboleth Attribute Approval - ${appName}`;
 
     const ATTRIBUTE_REFERENCE = `
@@ -1165,33 +1130,28 @@ mail - email address"
           </div>
         )}
         <div style={{ width:"1px", height:20, background:"#2a2d3e" }} />
-        {/* Import saved progress */}
         <input ref={importRef} type="file" accept=".json" style={{ display:"none" }} onChange={handleImportJSON} />
         <button onClick={() => importRef.current?.click()}
           title="Import saved progress from a JSON backup (exported from localStorage)"
           style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px", border:"1px solid #10b98155", borderRadius:6, background:"rgba(16,185,129,.08)", color:"#34d399", cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>
           📂 Import Progress
         </button>
-        {/* Upload new export */}
         <input ref={xlsxRef} type="file" accept=".xlsx,.xls" style={{ display:"none" }} onChange={handleXlsxUpload} />
         <button onClick={() => xlsxRef.current?.click()}
           style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px", border:"1px solid #2a2d3e", borderRadius:6, background:"transparent", color:"#64748b", cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>
           📥 Upload New Export
         </button>
-        {/* Run Report */}
         <button onClick={() => generateReport(tickets, meta, pct)}
           style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px", border:"1px solid #60a5fa55", borderRadius:6, background:"rgba(96,165,250,.1)", color:"#60a5fa", cursor:"pointer", fontSize:11, fontFamily:"monospace", fontWeight:600 }}>
           📊 Run Report
         </button>
         <div style={{ width:"1px", height:20, background:"#2a2d3e" }} />
-        {/* API Key button */}
         <button onClick={() => setShowApiKey(v => !v)}
           title={apiKey ? "API key is set — click to update" : "Set your Anthropic API key"}
           style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px", border:`1px solid ${apiKey?"#10b98155":"#f59e0b55"}`, borderRadius:6, background:apiKey?"rgba(16,185,129,.08)":"rgba(245,158,11,.1)", color:apiKey?"#34d399":"#f59e0b", cursor:"pointer", fontSize:11, fontFamily:"monospace", fontWeight:600 }}>
           🔑 {apiKey ? "Key ✓" : "Set Key"}
         </button>
         <div style={{ width:"1px", height:20, background:"#2a2d3e" }} />
-        {/* Google Drive sync */}
         {(() => {
           const STATUS = {
             disconnected: { color:"#475569", bg:"transparent",           border:"#2a2d3e",   icon:"☁️", label:"Connect Drive" },
@@ -1259,47 +1219,17 @@ mail - email address"
         </div>
       )}
 
-      {/* Diff banner */}
+      {/* ── FIX 2b: Minimal diff strip — detail shown inline in ticket list */}
       {diffResult && (diffResult.updated.length > 0 || diffResult.newTickets.length > 0 || diffResult.closed?.length > 0) && (
-        <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", padding:"10px 20px", display:"flex", gap:16, alignItems:"flex-start", flexWrap:"wrap" }}>
-          <div style={{ flex:1 }}>
-            <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:6, flexWrap:"wrap" }}>
-              <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#475569" }}>📥 {diffResult.fileName} · {diffResult.uploadedAt}</span>
-              {diffResult.newTickets.length > 0 && (
-                <span style={{ fontSize:11, padding:"2px 9px", borderRadius:10, background:"rgba(16,185,129,.15)", color:"#34d399", border:"1px solid rgba(16,185,129,.3)" }}>
-                  ✨ {diffResult.newTickets.length} new ticket{diffResult.newTickets.length>1?"s":""}
-                </span>
-              )}
-              {diffResult.updated.length > 0 && (
-                <span style={{ fontSize:11, padding:"2px 9px", borderRadius:10, background:"rgba(245,158,11,.15)", color:"#fbbf24", border:"1px solid rgba(245,158,11,.3)" }}>
-                  🔄 {diffResult.updated.length} updated
-                </span>
-              )}
-              {diffResult.closed?.length > 0 && (
-                <span style={{ fontSize:11, padding:"2px 9px", borderRadius:10, background:"rgba(71,85,105,.2)", color:"#94a3b8", border:"1px solid rgba(71,85,105,.4)" }}>
-                  ✓ {diffResult.closed.length} closed
-                </span>
-              )}
-            </div>
-            <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
-              {diffResult.newTickets.map(t => (
-                <div key={t.number} style={{ fontSize:11, padding:"3px 9px", background:"rgba(16,185,129,.08)", border:"1px solid rgba(16,185,129,.25)", borderRadius:6, color:"#34d399" }}>
-                  ✨ {t.number} — {t.desc.slice(0,40)}{t.desc.length>40?"…":""}
-                </div>
-              ))}
-              {diffResult.updated.map(t => (
-                <div key={t.number} title={t.changes.join("\n")} style={{ fontSize:11, padding:"3px 9px", background:"rgba(245,158,11,.08)", border:"1px solid rgba(245,158,11,.25)", borderRadius:6, color:"#fbbf24", cursor:"help" }}>
-                  🔄 {t.number} — {t.changes[0]}{t.changes.length>1?` +${t.changes.length-1} more`:""}
-                </div>
-              ))}
-              {diffResult.closed?.map(t => (
-                <div key={t.number} title="Not present in new export — marked Closed" style={{ fontSize:11, padding:"3px 9px", background:"rgba(71,85,105,.08)", border:"1px solid rgba(71,85,105,.3)", borderRadius:6, color:"#94a3b8", cursor:"help" }}>
-                  ✓ {t.number} — {t.desc.slice(0,40)}{t.desc.length>40?"…":""}
-                </div>
-              ))}
-            </div>
-          </div>
-          <button onClick={() => setDiffResult(null)} style={{ border:"none", background:"none", color:"#334155", cursor:"pointer", fontSize:16, padding:"0 4px", flexShrink:0 }}>✕</button>
+        <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", padding:"6px 20px", display:"flex", alignItems:"center", gap:10 }}>
+          <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#475569", flex:1 }}>
+            📥 {diffResult.fileName}
+            {diffResult.newTickets.length > 0 && <span style={{ color:"#34d399", marginLeft:10 }}>✨ {diffResult.newTickets.length} new</span>}
+            {diffResult.updated.length     > 0 && <span style={{ color:"#fbbf24", marginLeft:10 }}>🔄 {diffResult.updated.length} updated</span>}
+            {(diffResult.closed?.length    || 0) > 0 && <span style={{ color:"#94a3b8", marginLeft:10 }}>✓ {diffResult.closed.length} closed</span>}
+            <span style={{ color:"#334155", marginLeft:10 }}>· highlighted in list below</span>
+          </span>
+          <button onClick={() => setDiffResult(null)} style={{ border:"none", background:"none", color:"#475569", cursor:"pointer", fontSize:14, padding:"0 4px" }}>✕</button>
         </div>
       )}
 
@@ -1359,12 +1289,22 @@ mail - email address"
               const fuOv    = t.m.followUp && new Date(t.m.followUp) <= new Date();
               const waitingOnThem = needsResponse(t);
               const lastAuthor = lastCommentAuthor(t.comments);
+              // ── FIX 2c: Diff highlighting
+              const isNew      = diffNewNums.has(t.number);
+              const isUpdated  = diffUpdatedNums.has(t.number);
+              const diffChanges = diffChangesMap[t.number] || [];
+              const leftColor  = isOn ? "#60a5fa" : isNew ? "#10b981" : isUpdated ? "#f59e0b" : waitingOnThem ? "#f59e0b" : "transparent";
+              const rowBg      = isOn ? "#1a1e2e" : isNew ? "rgba(16,185,129,.05)" : isUpdated ? "rgba(245,158,11,.05)" : undefined;
               return (
                 <div key={t.number} className={`trow${isOn?" sel":""}`}
                   onClick={() => { setSelected(t); setTab("workflow"); setAiDraft({text:"",loading:false,type:""}); }}
-                  style={{ padding:"11px 12px", borderLeft:"3px solid", borderLeftColor:isOn?"#60a5fa":waitingOnThem?"#f59e0b":"transparent", cursor:"pointer", borderBottom:"1px solid #1a1e2e", transition:"all .15s" }}>
+                  style={{ padding:"11px 12px", borderLeft:"3px solid", borderLeftColor:leftColor, cursor:"pointer", borderBottom:"1px solid #1a1e2e", transition:"all .15s", background:rowBg }}>
                   <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:3 }}>
-                    <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#334155" }}>{t.number}</span>
+                    <div style={{ display:"flex", alignItems:"center", gap:5 }}>
+                      <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#334155" }}>{t.number}</span>
+                      {isNew     && <span style={{ fontSize:9, padding:"1px 5px", borderRadius:3, background:"rgba(16,185,129,.25)", color:"#34d399", fontWeight:700, letterSpacing:.3 }}>NEW</span>}
+                      {isUpdated && <span title={diffChanges.join("\n")} style={{ fontSize:9, padding:"1px 5px", borderRadius:3, background:"rgba(245,158,11,.25)", color:"#fbbf24", fontWeight:700, letterSpacing:.3, cursor:"help" }}>UPDATED</span>}
+                    </div>
                     <div style={{ display:"flex", gap:3, alignItems:"center" }}>
                       {fuOv && <span title="Follow-up overdue" style={{fontSize:10}}>🔴</span>}
                       {waitingOnThem && <span title={`Last comment by ${lastAuthor} — awaiting your response`} style={{fontSize:10}}>💬</span>}
@@ -1459,7 +1399,6 @@ mail - email address"
                       </div>
                     </div>
 
-                    {/* ── Initial Message Sent? ── */}
                     {(() => {
                       const wf = sel.m.workflow || {};
                       const formsExist    = wf.Initial_Message_Sent;
@@ -1486,19 +1425,12 @@ mail - email address"
                         </div>
                       );
 
-                      const missingForms = formsExist ? [] : [
-                        ...(!loginForm ? ["Login Request Form"] : []),
-                        ...(!confForm  ? ["Confidentiality Form"] : []),
-                      ];
-
                       return (
                         <>
-                          {/* Initial Message Sent? */}
                           <StepRow id="Initial_Message_Sent" label="Initial Message Sent?" icon="📋"
                             checked={formsExist}
                             onClick={() => toggleStep(sel.number, "Initial_Message_Sent")}>
 
-                            {/* Sub-items: always show once Initial_Message_Sent is toggled or forms are partially checked */}
                             <div style={{ marginLeft:24, marginTop:4, marginBottom:2 }}>
                               <StepRow id="login_form" label="Login Request Form received" icon="📄"
                                 checked={loginForm} dimmed={false}
@@ -1508,7 +1440,6 @@ mail - email address"
                                 onClick={() => toggleStep(sel.number, "conf_form")} />
                             </div>
 
-                            {/* Missing forms action */}
                             {(!loginForm || !confForm) && (
                               <div style={{ marginLeft:24, marginBottom:6 }}>
                                 <div style={{ fontSize:11, color:"#f59e0b", marginBottom:5, padding:"5px 10px", background:"rgba(245,158,11,.08)", borderRadius:6, border:"1px solid rgba(245,158,11,.2)" }}>
@@ -1523,7 +1454,6 @@ mail - email address"
                             )}
                           </StepRow>
 
-                          {/* Security review */}
                           <div style={{ marginBottom:5 }}>
                             <div className="srow" onClick={() => toggleStep(sel.number, "security_review")}
                               style={{ display:"flex", alignItems:"center", gap:10, padding:"9px 12px", borderRadius:7,
@@ -1538,7 +1468,6 @@ mail - email address"
                             </div>
 
                             {secReview ? (
-                              /* Yes — ask for proof */
                               <div style={{ marginLeft:24, marginTop:4 }}>
                                 <div className="srow" onClick={() => toggleStep(sel.number, "security_review_proof")}
                                   style={{ display:"flex", alignItems:"center", gap:10, padding:"9px 12px", borderRadius:7,
@@ -1558,7 +1487,6 @@ mail - email address"
                                 )}
                               </div>
                             ) : (
-                              /* No — show guide links */
                               <div style={{ marginLeft:24, marginTop:4, marginBottom:4 }}>
                                 <div style={{ fontSize:11, color:"#94a3b8", marginBottom:6, padding:"7px 10px", background:"rgba(255,255,255,.02)", borderRadius:6, border:"1px solid #2a2d3e" }}>
                                   Security review required before SSO can go live. Send requester the appropriate link:
@@ -1577,7 +1505,6 @@ mail - email address"
                             )}
                           </div>
 
-                          {/* Remaining standard steps */}
                           {[
                             { id:"forms_reviewed",    label:"Form review complete",             icon:"🔍" },
                             { id:"steward_sent",      label:"Data Steward approval requested",  icon:"📨" },
@@ -1626,12 +1553,10 @@ mail - email address"
                     ))}
                   </div>
 
-                  {/* Final attributes + steward approval — full width */}
                   <div style={{ gridColumn:"1/-1", background:"#141720", borderRadius:10, border:"1px solid #2563eb33", padding:18 }}>
                     <h3 style={{ margin:"0 0 4px", color:"#e2e8f0", fontSize:14, fontWeight:600 }}>📨 Data Steward Approval Request</h3>
                     <p style={{ margin:"0 0 14px", color:"#475569", fontSize:12 }}>Document the final confirmed attributes and audience before generating the steward email. These fields override anything pulled from the uploaded form.</p>
 
-                    {/* Audience checkboxes */}
                     <div style={{ marginBottom:14 }}>
                       <div style={{ color:"#94a3b8", fontSize:12, marginBottom:7, fontWeight:600 }}>Audience (select all that apply)</div>
                       <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
@@ -1653,7 +1578,6 @@ mail - email address"
                       </div>
                     </div>
 
-                    {/* Final attributes textarea */}
                     <div style={{ marginBottom:14 }}>
                       <div style={{ color:"#94a3b8", fontSize:12, marginBottom:6, fontWeight:600 }}>
                         Final Confirmed Attributes
@@ -1677,7 +1601,7 @@ mail - email address"
                     </button>
                   </div>
 
-                  {/* ── Gerry Handoff Panel ── */}
+                  {/* Gerry Handoff Panel */}
                   {(() => {
                     const ssoin = sel.m.ssoin || {};
                     const patchSsoin = (fields) => patch(sel.number, { ssoin: { ...ssoin, ...fields } });
@@ -1759,7 +1683,6 @@ mail - email address"
                           ))}
                         </div>
 
-                        {/* Multiline fields */}
                         {SSOIN_FIELDS.filter(f => f.multiline).map(f => (
                           <div key={f.key} style={{ marginBottom:10 }}>
                             <div style={{ fontSize:11, color: f.required?"#94a3b8":"#475569", marginBottom:3 }}>
@@ -1774,7 +1697,6 @@ mail - email address"
                           </div>
                         ))}
 
-                        {/* Fill from finalAttributes shortcut */}
                         {sel.m.finalAttributes?.trim() && !ssoin.attributes_released?.trim() && (
                           <button onClick={() => patchSsoin({ attributes_released: sel.m.finalAttributes })}
                             style={{ fontSize:11, padding:"4px 10px", border:"1px solid #2563eb44", borderRadius:5, background:"rgba(96,165,250,.08)", color:"#60a5fa", cursor:"pointer", marginBottom:12 }}>
@@ -1801,7 +1723,6 @@ mail - email address"
                 const fa = sel.m.formAnalysis;
                 return (
                   <div>
-                    {/* Request Form upload */}
                     <div className="drop" onClick={() => fileRef.current?.click()} style={{ marginBottom:10 }}>
                       <input ref={fileRef} type="file" accept=".pdf,.docx" style={{ display:"none" }} onChange={handleUpload} />
                       {formBusy
@@ -1814,7 +1735,6 @@ mail - email address"
                       }
                     </div>
 
-                    {/* Metadata XML upload */}
                     <div className="drop" onClick={() => metaRef.current?.click()} style={{ marginBottom:16, borderColor: sel.m.ssoin?.metadata_file ? "#10b98155" : undefined, background: sel.m.ssoin?.metadata_file ? "rgba(16,185,129,.03)" : undefined }}>
                       <input ref={metaRef} type="file" accept=".xml,text/xml,application/xml" style={{ display:"none" }} onChange={handleMetadataUpload} />
                       {metaBusy
@@ -1977,14 +1897,12 @@ mail - email address"
           </div>
         ) : showReport ? (
           <div style={{ flex:1, overflowY:"auto", padding:"20px 24px", background:"#0f1117" }}>
-            {/* Summary row */}
             <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:18 }}>
               <div>
                 <h2 style={{ margin:"0 0 3px", color:"#f1f5f9", fontSize:18, fontWeight:700 }}>📊 Pending Actions Report</h2>
                 <div style={{ color:"#475569", fontSize:11, fontFamily:"monospace" }}>{new Date().toLocaleString()} · {tickets.length} tickets</div>
               </div>
             </div>
-            {/* State summary */}
             <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:20 }}>
               {["Open","Pending","In Progress","On Hold"].map(s => {
                 const cnt = tickets.filter(t => t.state===s).length;
@@ -1997,7 +1915,6 @@ mail - email address"
                 );
               })}
             </div>
-            {/* Ticket cards */}
             {tickets.map(t => {
               const m        = meta[t.number] || blankMeta();
               const wf       = m.workflow || {};
@@ -2009,10 +1926,8 @@ mail - email address"
               const fuOv     = m.followUp && new Date(m.followUp) <= new Date();
               const formFlags = m.formAnalysis?.flags || [];
               const sm       = STATE_META[t.state] || {};
-              const hasActions = nr || fuOv || formFlags.length > 0;
               return (
                 <div key={t.number} style={{ background:"#141720", border:"1px solid #2a2d3e", borderRadius:10, padding:16, marginBottom:12 }}>
-                  {/* Header */}
                   <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10 }}>
                     <div style={{ flex:1 }}>
                       <div style={{ display:"flex", gap:7, alignItems:"center", marginBottom:3, flexWrap:"wrap" }}>
@@ -2023,7 +1938,8 @@ mail - email address"
                         {fuOv && <span style={{ fontSize:10, padding:"1px 7px", borderRadius:10, background:"rgba(239,68,68,.15)", color:"#f87171", border:"1px solid rgba(239,68,68,.3)" }}>🔴 Follow-up overdue</span>}
                       </div>
                       <div style={{ color:"#e2e8f0", fontSize:14, fontWeight:600, marginBottom:4 }}>{t.desc}</div>
-                      <div style={{ color:"#475569", fontSize:11, fontFamily:"monospace" }}>👤 {t.assignee} · 📅 {t.created} · 🔄 {t.updated}{lastAuth ? ` · ↩ ${lastAuth}` : ""}</div>                    </div>
+                      <div style={{ color:"#475569", fontSize:11, fontFamily:"monospace" }}>👤 {t.assignee} · 📅 {t.created} · 🔄 {t.updated}{lastAuth ? ` · ↩ ${lastAuth}` : ""}</div>
+                    </div>
                     <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:4, flexShrink:0, marginLeft:12 }}>
                       <div style={{ width:80, height:4, background:"#2a2d3e", borderRadius:2 }}>
                         <div style={{ width:`${p}%`, height:"100%", background:p===100?"#10b981":"#60a5fa", borderRadius:2 }} />
@@ -2037,7 +1953,6 @@ mail - email address"
                   </div>
 
                   <div style={{ display:"grid", gridTemplateColumns: pending.length && done.length ? "1fr 1fr" : "1fr", gap:12 }}>
-                    {/* Pending steps */}
                     {pending.length > 0 && (
                       <div>
                         <div style={{ fontSize:10, fontWeight:700, color:"#475569", textTransform:"uppercase", letterSpacing:.6, marginBottom:5 }}>📋 Pending Steps</div>
@@ -2046,7 +1961,6 @@ mail - email address"
                         ))}
                       </div>
                     )}
-                    {/* Done steps */}
                     {done.length > 0 && pending.length > 0 && (
                       <div>
                         <div style={{ fontSize:10, fontWeight:700, color:"#475569", textTransform:"uppercase", letterSpacing:.6, marginBottom:5 }}>✓ Completed</div>
@@ -2060,7 +1974,6 @@ mail - email address"
                     )}
                   </div>
 
-                  {/* Form flags */}
                   {formFlags.length > 0 && (
                     <div style={{ marginTop:10 }}>
                       <div style={{ fontSize:10, fontWeight:700, color:"#475569", textTransform:"uppercase", letterSpacing:.6, marginBottom:5 }}>⚠ Form Issues</div>
@@ -2070,7 +1983,6 @@ mail - email address"
                     </div>
                   )}
 
-                  {/* Notes */}
                   {m.note?.trim() && (
                     <div style={{ marginTop:10, fontSize:12, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:6, padding:"8px 10px", color:"#64748b", whiteSpace:"pre-wrap" }}>
                       <span style={{ color:"#334155", fontWeight:700 }}>📝 </span>{m.note.trim()}
