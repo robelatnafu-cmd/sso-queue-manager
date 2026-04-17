@@ -196,13 +196,28 @@ function needsResponse(ticket) {
 }
 
 // Returns a short next-action descriptor for use in the ticket list and triage mode
-function nextAction(ticket, wf) {
-  wf = wf || {};
+// nextAction: considers workflow steps, comment activity, AND parsed Q&A log
+function nextAction(ticket, wf, qaLog) {
+  wf    = wf    || {};
+  qaLog = qaLog || [];
+
+  // Someone external responded — we need to reply
   if (needsResponse(ticket)) {
     const author = lastCommentAuthor(ticket.comments);
-    const age = daysSince(ticket.updated);
-    return { label: `Reply to ${author}${age > 3 ? " · " + age + "d ago" : ""}`, color:"#f59e0b", icon:"💬" };
+    const age    = daysSince(ticket.updated);
+    // If QA log has open questions we sent, surface that context
+    const openQs = qaLog.filter(e => !e.resolved).length;
+    const suffix = openQs > 0 ? ` · ${openQs} open question${openQs>1?"s":""}` : (age > 3 ? ` · ${age}d ago` : "");
+    return { label: `Reply to ${author}${suffix}`, color:"#f59e0b", icon:"💬" };
   }
+
+  // We have unanswered questions we sent — waiting
+  const pendingOurs = qaLog.filter(e => !e.resolved &&
+    (e.source?.includes("comment") || e.responder === "from comments")).length;
+  if (pendingOurs > 0) {
+    return { label: `Awaiting responses · ${pendingOurs} open question${pendingOurs>1?"s":""}`, color:"#f59e0b", icon:"⏳" };
+  }
+
   if (!wf.Initial_Message_Sent) return { label:"Send initial message / request forms", color:"#60a5fa", icon:"📋" };
   if (!wf.login_form || !wf.conf_form) {
     const missing = [!wf.login_form && "Login Form", !wf.conf_form && "Conf. Form"].filter(Boolean).join(" & ");
@@ -605,6 +620,8 @@ function App() {
     return () => window.removeEventListener("sso_cost_update", handler);
   }, []);
   const [qaBusy,      setQaBusy]     = useState(false);
+  const [genRespBusy, setGenRespBusy] = useState(false);
+  const [autoScanProgress, setAutoScanProgress] = useState(null); // { current, total, done }
   const [qaPaste,     setQaPaste]    = useState("");
   const [qaResponder, setQaResponder] = useState("");
   const [qaMsg,       setQaMsg]      = useState(null); // { type:"success"|"info"|"error", text, advanced:[] }
@@ -757,6 +774,33 @@ function App() {
         });
 
         setDiffResult({ updated, newTickets, closed, uploadedAt: new Date().toLocaleString(), fileName: file.name });
+
+        // Auto-scan comments for all new + updated tickets that have comments
+        // Runs in background using Haiku — does not block UI
+        const toScan = [
+          ...newTickets.filter(t => t.comments?.trim()),
+          ...updated.filter(t => t.comments?.trim()),
+        ];
+        if (toScan.length > 0 && loadApiKey()) {
+          setAutoScanProgress({ current:0, total:toScan.length, done:false });
+          (async () => {
+            for (let i = 0; i < toScan.length; i++) {
+              const t = toScan[i];
+              setAutoScanProgress({ current:i+1, total:toScan.length, done:false });
+              try {
+                // Read existing meta for this ticket
+                const existingMeta = loadMeta()[t.number] || blankMeta();
+                const existingQa   = existingMeta.qaLog || [];
+                const existingWf   = existingMeta.workflow || {};
+                const existingSsoin = existingMeta.ssoin || {};
+                await autoScanTicket(t, existingQa, existingWf, existingSsoin, loadApiKey());
+              } catch(_) { /* silent — don't block on individual failures */ }
+              await new Promise(r => setTimeout(r, 300)); // small delay between calls
+            }
+            setAutoScanProgress({ current:toScan.length, total:toScan.length, done:true });
+            setTimeout(() => setAutoScanProgress(null), 4000);
+          })();
+        }
       } catch (err) {
         alert("Could not parse Excel file: " + err.message);
       }
@@ -1033,6 +1077,80 @@ Flag rules:
     }
   }
 
+  // ── Auto-scan a single ticket's comments (called on XLSX upload) ─────────
+  async function autoScanTicket(ticket, existingQa, existingWf, existingSsoin, key) {
+    if (!ticket.comments?.trim() || !key) return;
+    const prompt = `You are reviewing ServiceNow comments for an Emory SSO integration ticket.
+Ticket: ${ticket.number} — ${ticket.desc}
+
+Comments:
+---
+${ticket.comments.slice(0, 3000)}
+---
+
+Extract any question-answer pairs OR any actions/confirmations that advance the workflow.
+Focus ONLY on substantive content: form submissions, security review status, SAML confirmation,
+identifier decisions, steward approvals, access control clarification.
+Ignore routine status pings ("can you provide an update?", "following up", etc.).
+
+Return ONLY a JSON object in a \`\`\`json block:
+{
+  "entries": [
+    {
+      "question": "the question or topic being addressed",
+      "answer": "the response or confirmation",
+      "resolved": true or false,
+      "responder": "name of person who answered (from comment author)",
+      "autoAdvance": ["saml|ppid|access|security|steward|forms|initial"]
+    }
+  ],
+  "summary": "one sentence — what stage is this ticket at based on comments?"
+}
+
+autoAdvance keys:
+- initial: initial message/questions sent to requester
+- forms: login request form or confidentiality form submitted/attached
+- saml: SAML 2.0 support confirmed
+- ppid: primary identifier confirmed or alternative specified
+- access: authorization method clarified
+- security: security review submitted, completed, or attached
+- steward: data steward approved attribute release
+
+If no substantive Q&A content, return { "entries": [], "summary": "" }`;
+
+    try {
+      const raw = await claudeCall([{ role:"user", content:prompt }], QA_SYSTEM, key, MODEL_HAIKU, 800);
+      const match = raw.match(/```json\s*([\s\S]*?)```/) || raw.match(/(\{[\s\S]*\})/);
+      if (!match) return;
+      const parsed = JSON.parse(match[1]);
+      if (!parsed.entries?.length) return;
+
+      const now = new Date().toISOString();
+      const newEntries = parsed.entries.map((e, i) => ({
+        id: now + "_auto_" + ticket.number + "_" + i,
+        question:    e.question   || "",
+        answer:      e.answer     || "",
+        resolved:    e.resolved   ?? true,
+        responder:   e.responder  || "from comments",
+        source:      "Auto-scanned from comments",
+        date:        new Date().toLocaleDateString(),
+        autoAdvance: e.autoAdvance || [],
+      }));
+
+      // Merge, dedup, apply
+      const merged = [...existingQa];
+      for (const ne of newEntries) {
+        const isDupe = existingQa.some(e =>
+          e.question.toLowerCase().slice(0,40) === ne.question.toLowerCase().slice(0,40)
+        );
+        if (!isDupe) merged.push(ne);
+      }
+
+      const { wf: newWf, ssoin: newSsoin } = applyResolvedQA(merged, existingWf, existingSsoin);
+      patch(ticket.number, { qaLog: merged, workflow: newWf, ssoin: newSsoin });
+    } catch(_) { /* silent */ }
+  }
+
   // ── Parse pasted text OR comments into Q&A log entries ──────────────────
   async function parseQAText(rawText, responder, sourceLabel) {
     if (!rawText.trim()) return;
@@ -1126,6 +1244,80 @@ For autoAdvance, use these keys when the answer clearly resolves that item:
       return;
     }
     await parseQAText(sel.comments, "from comments", "ServiceNow comment snapshot");
+  }
+
+  // ── Generate best next comment/response based on ticket context ─────────
+  async function generateResponse() {
+    if (!sel) return;
+    setGenRespBusy(true);
+
+    const wf      = sel.m.workflow || {};
+    const qaLog   = sel.m.qaLog    || [];
+    const fa      = sel.m.formAnalysis;
+    const ssoin   = sel.m.ssoin    || {};
+    const openQs  = qaLog.filter(e => !e.resolved);
+    const resolvedQs = qaLog.filter(e => e.resolved);
+    const na      = nextAction(sel, wf, qaLog);
+
+    const context = [
+      `Ticket: ${sel.number} — ${sel.desc}`,
+      `State: ${sel.state} · Assignee: ${sel.assignee}`,
+      `Next action needed: ${na.label}`,
+      `Workflow progress: ${pct(sel.number)}%`,
+      wf.Initial_Message_Sent ? "✓ Initial message sent" : "✗ Initial message NOT sent",
+      wf.login_form   ? "✓ Login Request Form received"    : "✗ Login Form missing",
+      wf.conf_form    ? "✓ Confidentiality Form received"  : "✗ Confidentiality Form missing",
+      wf.security_review ? (wf.security_review_proof ? "✓ Security review complete + proof attached" : "✓ Security review done — proof still needed") : "✗ Security review not confirmed",
+      wf.forms_reviewed   ? "✓ Forms reviewed"           : "✗ Forms not yet reviewed",
+      wf.steward_sent     ? "✓ Steward email sent"       : "✗ Steward approval not requested",
+      wf.steward_approved ? "✓ Steward approved"         : "✗ Steward approval pending",
+      wf.handoff_to_gerry ? "✓ Handed off to Gerry"      : "✗ Not yet handed off",
+      openQs.length > 0
+        ? `Open questions (${openQs.length}): ${openQs.map(q => q.question).join("; ")}`
+        : "No open questions",
+      resolvedQs.length > 0
+        ? `Resolved: ${resolvedQs.map(q => q.question + " → " + q.answer.slice(0,60)).join("; ")}`
+        : "",
+      fa ? `Form analyzed: ${fa.appName || sel.desc}, ${fa.flags?.length || 0} flags` : "No form analyzed",
+      ssoin.entityid ? `Entity ID: ${ssoin.entityid}` : "",
+      ssoin.authentication_protocol ? `Protocol: ${ssoin.authentication_protocol}` : "",
+      ssoin.application_primary_identifier ? `Identifier: ${ssoin.application_primary_identifier}` : "",
+    ].filter(Boolean).join("\n");
+
+    const recentComments = (sel.comments || "").slice(-2000); // last ~2000 chars
+
+    const prompt = `You are ${sel.assignee === "RATNAFU" ? "Robel Atnafu" : sel.assignee === "JBURK22" ? "Joel Burke" : "Gerry Hall"} from Emory OIT Cybersecurity Architecture.
+Write the best next ServiceNow comment/response for this SSO integration ticket.
+
+${context}
+
+Recent comments (most recent last):
+---
+${recentComments || "No comments yet"}
+---
+
+Instructions:
+- Write ONLY the comment body text (no timestamp, no author prefix)
+- Be concise and professional
+- Address the most important missing item or respond to the latest message
+- If open questions exist, follow up on them specifically
+- If requester responded and resolved something, acknowledge and state the next step
+- If forms are missing, request them with the link: ${FORMS_LINK}
+- If security review is missing, provide the appropriate link based on context
+- Sign off: OIT Cybersecurity Architecture
+- Start with Hello, if addressing the requester; no greeting if it's a work note`;
+
+    try {
+      const text = await claudeCall([{ role:"user", content:prompt }], null, apiKey, MODEL_HAIKU, 600);
+      patch(sel.number, { commentDraft: text });
+      setTab("comments");
+    } catch(e) {
+      const msg = e.message === "NO_API_KEY"
+        ? "No API key set — click 🔑 Key in the top bar."
+        : "Error: " + e.message;
+      patch(sel.number, { commentDraft: msg });
+    }
+    setGenRespBusy(false);
   }
 
   async function genDraft(type) {
@@ -1573,6 +1765,23 @@ mail - email address"
         </div>
       )}
 
+      {/* Auto-scan progress strip */}
+      {autoScanProgress && !autoScanProgress.done && (
+        <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", padding:"6px 20px", display:"flex", alignItems:"center", gap:12 }}>
+          <div style={{ width:120, height:3, background:"#2a2d3e", borderRadius:2 }}>
+            <div style={{ width:`${(autoScanProgress.current/autoScanProgress.total)*100}%`, height:"100%", background:"#8b5cf6", borderRadius:2, transition:"width .3s" }} />
+          </div>
+          <span style={{ fontSize:10, color:"#8b5cf6", fontFamily:"monospace" }}>
+            ⟳ Auto-scanning comments · {autoScanProgress.current}/{autoScanProgress.total} tickets
+          </span>
+        </div>
+      )}
+      {autoScanProgress?.done && (
+        <div style={{ background:"rgba(16,185,129,.08)", borderBottom:"1px solid rgba(16,185,129,.2)", padding:"5px 20px" }}>
+          <span style={{ fontSize:10, color:"#34d399", fontFamily:"monospace" }}>✓ Comment scan complete — workflow and Q&A updated</span>
+        </div>
+      )}
+
       {/* ── FIX 2b: Minimal diff strip — detail shown inline in ticket list */}
       {diffResult && (diffResult.updated.length > 0 || diffResult.newTickets.length > 0 || diffResult.closed?.length > 0) && (
         <div style={{ background:"#141720", borderBottom:"1px solid #2a2d3e", padding:"6px 20px", display:"flex", alignItems:"center", gap:10 }}>
@@ -1702,7 +1911,7 @@ mail - email address"
                   </div>
                   <div style={{ color:isOn?"#e2e8f0":"#94a3b8", fontSize:12.5, lineHeight:1.4, marginBottom:4, fontWeight:isOn?600:400 }}>{t.desc}</div>
                   {(() => {
-                    const na = nextAction(t, t.m.workflow);
+                    const na = nextAction(t, t.m.workflow, t.m.qaLog);
                     return (
                       <div style={{ fontSize:10, color:na.color, marginBottom:5, display:"flex", alignItems:"center", gap:4, opacity: na.color === "#475569" ? 0.5 : 1 }}>
                         <span>{na.icon}</span>
@@ -2626,7 +2835,7 @@ mail - email address"
 
               {/* COMMENTS */}
               {tab==="comments" && (() => {
-                const na = nextAction(sel, sel.m.workflow);
+                const na = nextAction(sel, sel.m.workflow, sel.m.qaLog);
                 return (
                 <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
                   {/* Next action banner */}
@@ -2654,12 +2863,19 @@ mail - email address"
                   <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:16 }}>
                     <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
                       <h3 style={{ margin:0, color:"#e2e8f0", fontSize:14, fontWeight:600 }}>✏️ Draft Comment</h3>
-                      <div style={{ display:"flex", gap:6 }}>
-                        {aiDraft.text && aiDraft.type === "status_update" && (
-                          <button onClick={() => {
-                            patch(sel.number, { note: (sel.m.note ? sel.m.note + "\n\n" : "") + "--- Draft comment copied ---\n" + aiDraft.text });
-                          }} style={{ fontSize:10, padding:"3px 8px", border:"1px solid #2a2d3e", borderRadius:4, background:"transparent", color:"#475569", cursor:"pointer" }}>Save to notes</button>
-                        )}
+                      <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+                        <button onClick={generateResponse} disabled={genRespBusy || !apiKey}
+                          title={!apiKey ? "Set API key first" : "AI generates the best next response based on ticket state, open questions, and recent comments"}
+                          style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 12px",
+                            border:"1px solid #8b5cf644", borderRadius:6,
+                            background: genRespBusy ? "rgba(139,92,246,.15)" : "rgba(139,92,246,.08)",
+                            color: !apiKey ? "#334155" : "#a78bfa",
+                            cursor: (!apiKey || genRespBusy) ? "not-allowed" : "pointer",
+                            fontSize:11, fontWeight:600, opacity: !apiKey ? 0.5 : 1 }}>
+                          {genRespBusy
+                            ? <><span style={{ fontSize:12 }}>⟳</span> Generating…</>
+                            : <><span style={{ fontSize:12 }}>✨</span> Generate Response</>}
+                        </button>
                         <a href={snowUrl(sel.number)} target="_blank" rel="noreferrer" style={{ fontSize:11, color:"#60a5fa", textDecoration:"none" }}>Open in ServiceNow ↗</a>
                       </div>
                     </div>
