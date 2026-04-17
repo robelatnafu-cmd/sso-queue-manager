@@ -179,7 +179,10 @@ function lastCommentAuthor(comments) {
   if (!comments?.trim()) return "";
   const lines = comments.trim().split("\n").filter(l => l.trim());
   for (let i = lines.length - 1; i >= 0; i--) {
-    const m = lines[i].match(/^[\d/]+ [\d:]+(?:\s*[AP]M)? - (.+?)(?:\s*\([^)]*\))?:/);
+    // Handles both formats:
+    //   Old: "03/09 07:20 - Heidi Sarge: message..."
+    //   New: "04/13/2026 11:07:49 AM - Jimmy Nguyen (Work notes)"  ← no colon, role in parens
+    const m = lines[i].match(/^[\d/]+ [\d:]+(?:\s*[AP]M)? - (.+?)(?:\s*\([^)]*\))?(?::|$)/);
     if (m) return m[1].trim();
   }
   return "";
@@ -190,6 +193,29 @@ function needsResponse(ticket) {
   const author   = lastCommentAuthor(ticket.comments);
   const aliases  = ASSIGNEE_NAMES[ticket.assignee] || [];
   return author !== "" && !aliases.some(n => author.toLowerCase().includes(n.toLowerCase()));
+}
+
+// Returns a short next-action descriptor for use in the ticket list and triage mode
+function nextAction(ticket, wf) {
+  wf = wf || {};
+  if (needsResponse(ticket)) {
+    const author = lastCommentAuthor(ticket.comments);
+    const age = daysSince(ticket.updated);
+    return { label: `Reply to ${author}${age > 3 ? " · " + age + "d ago" : ""}`, color:"#f59e0b", icon:"💬" };
+  }
+  if (!wf.Initial_Message_Sent) return { label:"Send initial message / request forms", color:"#60a5fa", icon:"📋" };
+  if (!wf.login_form || !wf.conf_form) {
+    const missing = [!wf.login_form && "Login Form", !wf.conf_form && "Conf. Form"].filter(Boolean).join(" & ");
+    return { label:"Waiting for " + missing, color:"#475569", icon:"⏳" };
+  }
+  if (!wf.security_review) return { label:"Confirm security review status", color:"#60a5fa", icon:"🛡️" };
+  if (wf.security_review && !wf.security_review_proof) return { label:"Request proof of security review", color:"#f59e0b", icon:"📎" };
+  if (!wf.forms_reviewed) return { label:"Review the Login Request Form", color:"#60a5fa", icon:"🔍" };
+  if (!wf.steward_sent) return { label:"Send Data Steward approval email", color:"#60a5fa", icon:"📨" };
+  if (!wf.steward_approved) return { label:"Waiting for Data Steward approval", color:"#475569", icon:"⏳" };
+  if (!wf.handoff_to_gerry) return { label:"Hand off to Gerry for implementation", color:"#a78bfa", icon:"🤝" };
+  if (!wf.implemented) return { label:"Waiting for implementation (Gerry)", color:"#475569", icon:"⏳" };
+  return { label:"Complete ✓", color:"#10b981", icon:"🚀" };
 }
 
 
@@ -245,7 +271,7 @@ const loadTickets = () => { try { const s = localStorage.getItem(TICKETS_STORAGE
 const saveTickets = (t) => { try { localStorage.setItem(TICKETS_STORAGE_KEY, JSON.stringify(t)); } catch {} };
 const loadApiKey = () => { try { return localStorage.getItem(API_KEY_STORAGE) || ""; } catch { return ""; } };
 const saveApiKey = (k) => { try { localStorage.setItem(API_KEY_STORAGE, k); } catch {} };
-const blankMeta = () => ({ workflow:{}, followUp:"", priority:"Normal", note:"", formAnalysis:null, finalAttributes:"", finalAudience:[], ssoin:{} });
+const blankMeta = () => ({ workflow:{}, followUp:"", priority:"Normal", note:"", formAnalysis:null, finalAttributes:"", finalAudience:[], ssoin:{}, commentDraft:"" });
 
 async function readAsBase64(file) {
   return new Promise((res, rej) => {
@@ -497,6 +523,7 @@ function App() {
   const [staleDays, setStaleDays] = useState("");
   const [needsRespF, setNeedsRespF] = useState(false);
   const [diffResult, setDiffResult] = useState(null);
+  const [triageMode, setTriageMode]   = useState(false);
   const [showReport, setShowReport] = useState(false);
   const [metaBusy,   setMetaBusy]  = useState(false);
   const [driveStatus, setDriveStatus] = useState("disconnected");
@@ -1274,13 +1301,46 @@ mail - email address"
                   : `of ${tickets.filter(t => t.state !== "Closed").length} TOTAL`}
               </span>
             </div>
-            {(stateF !== "All" || assigneeF !== "All" || search || needsRespF || staleDays !== "") && (
-              <button onClick={() => { setStateF("All"); setAssigneeF("All"); setSearch(""); setNeedsRespF(false); setStaleDays(""); }}
-                style={{ fontSize:9, padding:"2px 7px", border:"1px solid #2a2d3e", borderRadius:4, background:"transparent", color:"#475569", cursor:"pointer", fontFamily:"monospace", letterSpacing:.4 }}>
-                CLEAR
+            <div style={{ display:"flex", gap:5, alignItems:"center" }}>
+              {(stateF !== "All" || assigneeF !== "All" || search || needsRespF || staleDays !== "") && (
+                <button onClick={() => { setStateF("All"); setAssigneeF("All"); setSearch(""); setNeedsRespF(false); setStaleDays(""); setTriageMode(false); }}
+                  style={{ fontSize:9, padding:"2px 7px", border:"1px solid #2a2d3e", borderRadius:4, background:"transparent", color:"#475569", cursor:"pointer", fontFamily:"monospace", letterSpacing:.4 }}>
+                  CLEAR
+                </button>
+              )}
+              <button onClick={() => {
+                setTriageMode(v => {
+                  if (!v) { setNeedsRespF(true); setStateF("All"); }
+                  else { setNeedsRespF(false); }
+                  return !v;
+                });
+              }}
+                title="Step through tickets that need your response"
+                style={{ fontSize:9, padding:"2px 9px", border:`1px solid ${triageMode?"#f59e0b55":"#2a2d3e"}`, borderRadius:4, background:triageMode?"rgba(245,158,11,.12)":"transparent", color:triageMode?"#f59e0b":"#475569", cursor:"pointer", fontFamily:"monospace", letterSpacing:.4, whiteSpace:"nowrap" }}>
+                {triageMode ? "⚡ TRIAGE ON" : "⚡ TRIAGE"}
               </button>
-            )}
+            </div>
           </div>
+          {triageMode && (
+            <div style={{ padding:"7px 12px", borderBottom:"1px solid #1a1e2e", background:"rgba(245,158,11,.08)", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+              <span style={{ fontSize:10, color:"#f59e0b", fontFamily:"'JetBrains Mono',monospace" }}>⚡ TRIAGE · {visible.length} to review</span>
+              <div style={{ display:"flex", gap:5 }}>
+                {sel && visible.length > 1 && (() => {
+                  const idx = visible.findIndex(t => t.number === sel.number);
+                  const prev = visible[idx - 1];
+                  const next = visible[idx + 1];
+                  return (
+                    <>
+                      <button disabled={!prev} onClick={() => { if(prev) { setSelected(prev); setTab("comments"); }}}
+                        style={{ fontSize:10, padding:"2px 8px", border:"1px solid #f59e0b44", borderRadius:4, background:"transparent", color:prev?"#f59e0b":"#334155", cursor:prev?"pointer":"default" }}>← Prev</button>
+                      <button disabled={!next} onClick={() => { if(next) { setSelected(next); setTab("comments"); }}}
+                        style={{ fontSize:10, padding:"2px 8px", border:"1px solid #f59e0b44", borderRadius:4, background:"transparent", color:next?"#f59e0b":"#334155", cursor:next?"pointer":"default" }}>Next →</button>
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
+          )}
           <div style={{ flex:1, overflowY:"auto" }}>
             {visible.map(t => {
               const isOn    = sel?.number === t.number;
@@ -1313,7 +1373,16 @@ mail - email address"
                       <span style={{ fontSize:10, padding:"1px 7px", borderRadius:10, background:sm.bg, color:sm.color, border:`1px solid ${sm.color}55` }}>{t.state}</span>
                     </div>
                   </div>
-                  <div style={{ color:isOn?"#e2e8f0":"#94a3b8", fontSize:12.5, lineHeight:1.4, marginBottom:6, fontWeight:isOn?600:400 }}>{t.desc}</div>
+                  <div style={{ color:isOn?"#e2e8f0":"#94a3b8", fontSize:12.5, lineHeight:1.4, marginBottom:4, fontWeight:isOn?600:400 }}>{t.desc}</div>
+                  {(() => {
+                    const na = nextAction(t, t.m.workflow);
+                    return (
+                      <div style={{ fontSize:10, color:na.color, marginBottom:5, display:"flex", alignItems:"center", gap:4, opacity: na.color === "#475569" ? 0.5 : 1 }}>
+                        <span>{na.icon}</span>
+                        <span style={{ fontFamily:"'JetBrains Mono',monospace", letterSpacing:.2 }}>{na.label}</span>
+                      </div>
+                    );
+                  })()}
                   <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                     <div style={{ display:"flex", flexDirection:"column", gap:1 }}>
                       <span style={{ color:"#334155", fontSize:10, fontFamily:"'JetBrains Mono',monospace" }}>{t.assignee} · {age}d</span>
@@ -1878,21 +1947,77 @@ mail - email address"
               )}
 
               {/* COMMENTS */}
-              {tab==="comments" && (
-                <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:18 }}>
-                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
-                    <h3 style={{ margin:0, color:"#e2e8f0", fontSize:14, fontWeight:600 }}>💬 ServiceNow Comments</h3>
-                    <a href={snowUrl(sel.number)} target="_blank" rel="noreferrer" style={{ color:"#60a5fa", fontSize:11, textDecoration:"none" }}>View live ↗</a>
+              {tab==="comments" && (() => {
+                const na = nextAction(sel, sel.m.workflow);
+                return (
+                <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+                  {/* Next action banner */}
+                  <div style={{ background:"#141720", borderRadius:10, border:`1px solid ${na.color}33`, padding:"12px 16px", display:"flex", alignItems:"center", gap:10 }}>
+                    <span style={{ fontSize:18 }}>{na.icon}</span>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontSize:11, color:"#475569", marginBottom:2 }}>NEXT ACTION</div>
+                      <div style={{ fontSize:13, color:na.color, fontWeight:600 }}>{na.label}</div>
+                    </div>
+                    {triageMode && (() => {
+                      const idx = visible.findIndex(t => t.number === sel.number);
+                      const next = visible[idx + 1];
+                      return next ? (
+                        <button onClick={() => { setSelected(next); }}
+                          style={{ fontSize:11, padding:"5px 12px", border:"1px solid #f59e0b55", borderRadius:6, background:"rgba(245,158,11,.1)", color:"#f59e0b", cursor:"pointer", whiteSpace:"nowrap" }}>
+                          Next ticket →
+                        </button>
+                      ) : (
+                        <span style={{ fontSize:11, color:"#10b981" }}>✓ Last ticket in triage</span>
+                      );
+                    })()}
                   </div>
-                  {sel.comments
-                    ? <div style={{ whiteSpace:"pre-wrap", fontSize:13, lineHeight:1.8, color:"#94a3b8", background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:8, padding:13 }}>{sel.comments}</div>
-                    : <div style={{ textAlign:"center", padding:"34px 0", color:"#334155" }}>
-                        <div style={{ fontSize:22, marginBottom:7 }}>💬</div>
-                        <div style={{ fontSize:13 }}>No comments in this snapshot — open in ServiceNow for live activity.</div>
+
+                  {/* Comment composer */}
+                  <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:16 }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+                      <h3 style={{ margin:0, color:"#e2e8f0", fontSize:14, fontWeight:600 }}>✏️ Draft Comment</h3>
+                      <div style={{ display:"flex", gap:6 }}>
+                        {aiDraft.text && aiDraft.type === "status_update" && (
+                          <button onClick={() => {
+                            patch(sel.number, { note: (sel.m.note ? sel.m.note + "\n\n" : "") + "--- Draft comment copied ---\n" + aiDraft.text });
+                          }} style={{ fontSize:10, padding:"3px 8px", border:"1px solid #2a2d3e", borderRadius:4, background:"transparent", color:"#475569", cursor:"pointer" }}>Save to notes</button>
+                        )}
+                        <a href={snowUrl(sel.number)} target="_blank" rel="noreferrer" style={{ fontSize:11, color:"#60a5fa", textDecoration:"none" }}>Open in ServiceNow ↗</a>
                       </div>
-                  }
+                    </div>
+                    <textarea
+                      value={sel.m.commentDraft || ""}
+                      onChange={e => patch(sel.number, { commentDraft: e.target.value })}
+                      placeholder={"Draft your ServiceNow comment here…\n\nTip: Use the Drafts tab to AI-generate a full email, then paste the body here."}
+                      style={{ width:"100%", minHeight:120, background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:7, padding:"10px 12px", color:"#cbd5e1", fontSize:13, lineHeight:1.65, resize:"vertical", outline:"none", marginBottom:8 }}
+                    />
+                    <div style={{ display:"flex", gap:7, alignItems:"center" }}>
+                      <button onClick={() => doCopy(sel.m.commentDraft || "", "comment_draft")}
+                        style={{ padding:"6px 14px", background:copied==="comment_draft"?"#10b981":"#1e3a5f", border:`1px solid ${copied==="comment_draft"?"#10b981":"#2563eb55"}`, borderRadius:6, color:copied==="comment_draft"?"white":"#60a5fa", cursor:"pointer", fontSize:12, fontWeight:600, transition:"all .2s" }}>
+                        {copied==="comment_draft" ? "✓ Copied" : "Copy to clipboard"}
+                      </button>
+                      <button onClick={() => patch(sel.number, { commentDraft: "" })}
+                        style={{ padding:"6px 10px", border:"1px solid #2a2d3e", borderRadius:6, background:"transparent", color:"#475569", cursor:"pointer", fontSize:11 }}>
+                        Clear
+                      </button>
+                      <span style={{ fontSize:10, color:"#334155", marginLeft:"auto" }}>Paste into the ServiceNow "Additional comments" field</span>
+                    </div>
+                  </div>
+
+                  {/* Snapshot of comments from export */}
+                  <div style={{ background:"#141720", borderRadius:10, border:"1px solid #2a2d3e", padding:16 }}>
+                    <h3 style={{ margin:"0 0 10px", color:"#e2e8f0", fontSize:14, fontWeight:600 }}>💬 Comment Snapshot</h3>
+                    {sel.comments
+                      ? <div style={{ whiteSpace:"pre-wrap", fontSize:13, lineHeight:1.8, color:"#94a3b8", background:"#0f1117", border:"1px solid #2a2d3e", borderRadius:8, padding:13 }}>{sel.comments}</div>
+                      : <div style={{ textAlign:"center", padding:"34px 0", color:"#334155" }}>
+                          <div style={{ fontSize:22, marginBottom:7 }}>💬</div>
+                          <div style={{ fontSize:13 }}>No comments in this snapshot — open in ServiceNow for live activity.</div>
+                        </div>
+                    }
+                  </div>
                 </div>
-              )}
+                );
+              })()}
             </div>
           </div>
         ) : showReport ? (
