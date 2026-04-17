@@ -320,12 +320,12 @@ Respond ONLY with valid JSON in a json code block — no prose outside it.`;
 
 // Maps text patterns → workflow step they resolve when answered satisfactorily
 const FLAG_MAP = [
-  { key:"saml",     patterns:["saml 2.0","saml2","saml support","saml is supported","supports saml"],       step:"forms_reviewed",   ssoinKey:"authentication_protocol", ssoinVal:(ans) => "SAML 2.0", label:"SAML 2.0 confirmed" },
-  { key:"ppid",     patterns:["ppid","serialnumber","public person id","identifier","email is required"],    step:"forms_reviewed",   ssoinKey:"application_primary_identifier", ssoinVal:(ans) => ans.toLowerCase().includes("email") ? "Email (mail)" : "SerialNumber (PPID)", label:"Primary identifier confirmed" },
-  { key:"access",   patterns:["access","authorization","who will have access","how will access","rbac"],     step:"forms_reviewed",   ssoinKey:"authorization_method", ssoinVal:(ans) => ans.slice(0,200), label:"Access/authorization clarified" },
-  { key:"security", patterns:["security review","security form","oit security","security questionnaire"],    step:"security_review",  ssoinKey:null, ssoinVal:null, label:"Security review addressed" },
-  { key:"steward",  patterns:["approve","approved","do you approve","steward approval","attribute approval"], step:"steward_approved", ssoinKey:null, ssoinVal:null, label:"Data steward approved" },
-  { key:"forms",    patterns:["login request form","confidentiality form","forms attached","form attached"],  step:"login_form",       ssoinKey:null, ssoinVal:null, label:"Forms received" },
+  { key:"saml",     patterns:["saml 2.0","saml2","saml support","saml is supported","supports saml"],       step:"forms_reviewed",   ssoinKey:"authentication_protocol",        ssoinVal:(ans) => "SAML 2.0",                                                                label:"SAML 2.0 confirmed" },
+  { key:"ppid",     patterns:["ppid","serialnumber","public person id","identifier","email is required"],    step:"forms_reviewed",   ssoinKey:"application_primary_identifier",  ssoinVal:(ans) => ans.toLowerCase().includes("email") ? "Email (mail)" : "SerialNumber (PPID)", label:"Primary identifier confirmed" },
+  { key:"access",   patterns:["access","authorization","who will have access","how will access","rbac"],     step:"forms_reviewed",   ssoinKey:"authorization_method",            ssoinVal:(ans) => ans.slice(0,200),                                                          label:"Access/authorization clarified" },
+  { key:"security", patterns:["security review","security form","oit security","security questionnaire"],    step:"security_review",  ssoinKey:"application_had_security_review", ssoinVal:(ans) => "true",                                                                    label:"Security review addressed" },
+  { key:"steward",  patterns:["approve","approved","do you approve","steward approval","attribute approval"], step:"steward_approved", ssoinKey:null,                              ssoinVal:null,                                                                               label:"Data steward approved" },
+  { key:"forms",    patterns:["login request form","confidentiality form","forms attached","form attached"],  step:"login_form",       ssoinKey:null,                              ssoinVal:null,                                                                               label:"Forms received" },
 ];
 
 // Apply resolved QA entries to workflow + ssoin fields, return { wf, ssoin, autoAdvanced }
@@ -910,23 +910,49 @@ Flag rules:
 
   function autoPopulateHandoff(num, analysis) {
     const existing = meta[num]?.ssoin || {};
-    const updates = {};
-    if (analysis.appName)             updates.application_name             = analysis.appName;
-    if (analysis.appDescription)      updates.application_description      = analysis.appDescription;
-    if (analysis.supportsSAML==="Yes") updates.authentication_protocol     = "SAML 2.0";
-    if (analysis.hasPPID)             updates.application_primary_identifier = "SerialNumber (PPID)";
-    if (analysis.accessLimitation)    updates.authorization_method         = analysis.accessLimitation;
-    if (analysis.attributes?.length)  updates.attributes_released          = analysis.attributes.join("\n");
-    if (analysis.entityId)            updates.entityid                     = analysis.entityId;
-    if (analysis.testUrl)             updates.test_url                     = analysis.testUrl;
-    if (analysis.hosting)             updates.application_hosting          = analysis.hosting;
-    if (analysis.vendor)              updates.vendor                       = analysis.vendor;
-    if (analysis.vendorContact)       updates.vendor_contact_name          = analysis.vendorContact;
-    if (analysis.vendorEmail)         updates.vendor_contact_email_address = analysis.vendorEmail;
-    if (analysis.emoryContact)        updates.application_business_owner_name  = analysis.emoryContact;
-    if (analysis.emoryContactNetId)   updates.application_business_owner_netid = analysis.emoryContactNetId;
-    if (analysis.supervisorName)      updates.application_technical_owner_name  = analysis.supervisorName;
-    if (analysis.supervisorNetId)     updates.application_technical_owner_netid = analysis.supervisorNetId;
+    const updates  = {};
+    const set = (key, val) => { if (val && !existing[key]) updates[key] = val; };
+    const overwrite = (key, val) => { if (val) updates[key] = val; };
+
+    // Always overwrite from form (form is the authoritative source)
+    overwrite("application_name",                  analysis.appName);
+    overwrite("application_description",           analysis.appDescription);
+    overwrite("entityid",                          analysis.entityId);
+    overwrite("test_url",                          analysis.testUrl);
+    overwrite("application_hosting",               analysis.hosting);
+    overwrite("vendor",                            analysis.vendor);
+    overwrite("vendor_contact_name",               analysis.vendorContact);
+    overwrite("vendor_contact_email_address",      analysis.vendorEmail);
+    overwrite("application_business_owner_name",   analysis.emoryContact);
+    overwrite("application_business_owner_netid",  analysis.emoryContactNetId);
+    overwrite("application_technical_owner_name",  analysis.supervisorName);
+    overwrite("application_technical_owner_netid", analysis.supervisorNetId);
+    overwrite("authorization_method",              analysis.accessLimitation);
+    if (analysis.attributes?.length)
+      overwrite("attributes_released", analysis.attributes.join("\n"));
+    // Protocol — only set if not already specified
+    if (analysis.supportsSAML === "Yes")
+      set("authentication_protocol", "SAML 2.0");
+    // Identifier — PPID from form; don't overwrite if already set to something else
+    if (analysis.hasPPID)
+      set("application_primary_identifier", "SerialNumber (PPID)");
+    // Security review status
+    if (analysis.securityReview === "Completed")
+      set("application_had_security_review", "true");
+    // Audience checkboxes from form analysis
+    if (analysis.audience?.includes("University employees")) {
+      set("is_audience_euv_staff",   "true");
+      set("is_audience_euv_faculty", "true");
+    }
+    if (analysis.audience?.includes("University students"))  set("is_audience_euv_students",  "true");
+    if (analysis.audience?.includes("Healthcare employees")) set("is_audience_ehc_staff",      "true");
+    // Pre-fill ServiceNow ticket references from the ticket itself
+    if (!existing.snow_task && num.startsWith("SCTASK")) set("snow_task",    num);
+    if (!existing.snow_incident && num.startsWith("INC")) set("snow_incident", num);
+    // RITM from ticketList — best effort
+    const tkt = ticketList?.find(t => t.number === num);
+    if (tkt?.ritm) set("snow_request_item", tkt.ritm);
+
     if (Object.keys(updates).length) {
       patch(num, { ssoin: { ...existing, ...updates } });
     }
@@ -1193,9 +1219,60 @@ Format requirements:
           s.implementation_notes     && `Notes: ${s.implementation_notes}`,
         ].filter(Boolean).join("\n");
 
+        // Build comprehensive fields block from all SSOIN sections
+        const s2 = sel.m.ssoin || {};
+        const allFields = [
+          // ServiceNow refs
+          s2.snow_request_item   && `RITM: ${s2.snow_request_item}`,
+          s2.snow_task           && `Task: ${s2.snow_task}`,
+          s2.snow_incident       && `Incident: ${s2.snow_incident}`,
+          // Application
+          s2.application_name         && `Application: ${s2.application_name}`,
+          s2.application_alternate_name && `Alternate Name: ${s2.application_alternate_name}`,
+          s2.entityid                 && `Entity ID: ${s2.entityid}`,
+          s2.test_url                 && `ACS / Test URL: ${s2.test_url}`,
+          s2.application_hosting      && `Hosting: ${s2.application_hosting}`,
+          s2.application_criticality  && `Criticality: ${s2.application_criticality}`,
+          s2.application_sensitive_data && `Sensitive Data: ${s2.application_sensitive_data}`,
+          s2.incommon_member          && `InCommon Member: ${s2.incommon_member}`,
+          s2.enterprise_domain        && `Enterprise Domain: ${s2.enterprise_domain}`,
+          // Business owner
+          s2.application_business_owner_name  && `Business Owner: ${s2.application_business_owner_name}${s2.application_business_owner_netid ? " (" + s2.application_business_owner_netid + ")" : ""}${s2.application_business_owner_ppid ? " PPID:" + s2.application_business_owner_ppid : ""}`,
+          s2.application_business_owner_department_name && `Department: ${s2.application_business_owner_department_name}${s2.application_business_owner_department_number ? " (" + s2.application_business_owner_department_number + ")" : ""}`,
+          s2.department_email_address && `Department Email: ${s2.department_email_address}`,
+          // Technical owner
+          s2.application_technical_owner_name && `Technical Owner: ${s2.application_technical_owner_name}${s2.application_technical_owner_netid ? " (" + s2.application_technical_owner_netid + ")" : ""}${s2.application_technical_owner_ppid ? " PPID:" + s2.application_technical_owner_ppid : ""}`,
+          // Vendor
+          s2.vendor               && `Vendor: ${s2.vendor}`,
+          s2.vendor_contact_name  && `Vendor Contact: ${s2.vendor_contact_name}${s2.vendor_contact_email_address ? " <" + s2.vendor_contact_email_address + ">" : ""}`,
+          // Security
+          s2.application_had_security_review          && `Security Review: ${s2.application_had_security_review === "true" ? "Completed" : s2.application_had_security_review}`,
+          s2.application_security_review_documentation && `Security Review Doc: ${s2.application_security_review_documentation}`,
+          // Auth
+          s2.enterprise_authentication      && `Enterprise Auth: ${s2.enterprise_authentication}`,
+          s2.authentication_protocol        && `Protocol: ${s2.authentication_protocol}`,
+          s2.application_primary_identifier && `Primary Identifier: ${s2.application_primary_identifier}`,
+          s2.non_ppid_justification         && `Non-PPID Justification: ${s2.non_ppid_justification}`,
+          s2.authorization_method           && `Authorization Method: ${s2.authorization_method}`,
+          // Audience
+          (() => {
+            const auds = [
+              s2.is_audience_euv_staff    === "true" && "EUV Staff",
+              s2.is_audience_euv_faculty  === "true" && "EUV Faculty",
+              s2.is_audience_euv_students === "true" && "EUV Students",
+              s2.is_audience_euv_sponsored=== "true" && "EUV Sponsored",
+              s2.is_audience_ehc_staff    === "true" && "EHC Staff",
+              s2.is_audience_ehc_sponsored=== "true" && "EHC Sponsored",
+            ].filter(Boolean);
+            return auds.length ? `Audience: ${auds.join(", ")}` : null;
+          })(),
+          s2.implementation_notes && `Notes: ${s2.implementation_notes}`,
+          s2.metadata_file        && `SAML Metadata: ${s2.metadata_file} (attached)`,
+        ].filter(Boolean).join("\n");
+
         const qaResolved = (sel.m.qaLog || []).filter(e => e.resolved);
         const qaContext = qaResolved.length > 0
-          ? "\n\nConfirmed details from vendor/requester Q&A:\n" +
+          ? "\n\nConfirmed details from vendor/requester responses:\n" +
             qaResolved.map(e => `- ${e.question.trim()}: ${e.answer.trim()}`).join("\n")
           : "";
 
@@ -1203,7 +1280,7 @@ Format requirements:
 
 Ticket: ${sel.number} — ${sel.desc}
 
-${fields}${qaContext}
+${allFields}${qaContext}
 
 Approved attributes to release:
 ${attrLines || "(see attributes above)"}
@@ -1829,39 +1906,152 @@ mail - email address"
                     const ssoin = sel.m.ssoin || {};
                     const patchSsoin = (fields) => patch(sel.number, { ssoin: { ...ssoin, ...fields } });
 
-                    const SSOIN_FIELDS = [
-                      { key:"application_name",                   label:"Application Name",                   required:true },
-                      { key:"application_alternate_names",        label:"Alternate Name(s)",                  required:false },
-                      { key:"application_description",            label:"Application Description",            required:false },
-                      { key:"entityid",                           label:"Entity ID",                          required:true },
-                      { key:"test_url",                           label:"ACS / Test URL",                     required:false },
-                      { key:"slo_url",                            label:"Single Logout URL (SLO)",            required:false },
-                      { key:"application_business_owner_name",    label:"Business Owner Name (Emory Contact)",     required:false },
-                      { key:"application_business_owner_netid",   label:"Business Owner NetID",                    required:false },
-                      { key:"application_technical_owner_name",   label:"Technical Owner Name (Supervisor)",        required:false },
-                      { key:"application_technical_owner_netid",  label:"Technical Owner NetID",                   required:false },
-                      { key:"department_email_address",           label:"Department Email Address",           required:false },
-                      { key:"vendor",                             label:"Vendor",                             required:false },
-                      { key:"vendor_contact_name",                label:"Vendor Contact Name",                required:false },
-                      { key:"vendor_contact_email_address",       label:"Vendor Contact Email",               required:false },
-                      { key:"application_hosting",                label:"Hosting (Cloud/On-Prem/Hybrid)",     required:false },
-                      { key:"application_criticality",            label:"Application Criticality",            required:false },
-                      { key:"application_sensitive_data",         label:"Sensitive Data?",                    required:false },
-                      { key:"application_type",                   label:"Application Type",                   required:false },
-                      { key:"authentication_protocol",            label:"Auth Protocol (SAML/OIDC)",          required:true },
-                      { key:"application_primary_identifier",     label:"Primary Identifier",                 required:true },
-                      { key:"non_ppid_justification",             label:"Non-PPID Justification",             required:false },
-                      { key:"authorization_method",               label:"Authorization Method",               required:false },
-                      { key:"attributes_released",                label:"Attributes Released",                required:true, multiline:true, placeholder:"givenName - legal first name\nsn - last name\nmail - email address" },
-                      { key:"implementation_notes",               label:"Implementation Notes",               required:false, multiline:true },
+                    // ── All SSOIN fields grouped by section ──────────────────────────────────────
+                    const SSOIN_SECTIONS = [
+                      {
+                        title: "🎫 ServiceNow References", cols: 2,
+                        fields: [
+                          { key:"snow_request_item",       label:"Request Item (RITM)",         required:false, placeholder:"RITM0012345" },
+                          { key:"snow_task",               label:"Task (SCTASK)",                required:false, placeholder:"SCTASK0012345" },
+                          { key:"snow_request",            label:"Request (REQ)",                required:false, placeholder:"REQ0012345" },
+                          { key:"snow_incident",           label:"Incident (INC)",               required:false, placeholder:"INC0012345" },
+                          { key:"snow_archive_incident",   label:"Archive Incident",             required:false },
+                        ]
+                      },
+                      {
+                        title: "📱 Application", cols: 2,
+                        fields: [
+                          { key:"application_name",         label:"Application Name",            required:true },
+                          { key:"application_alternate_name", label:"Alternate Name(s)",         required:false },
+                          { key:"application_description",  label:"Application Description",     required:false, span:2 },
+                          { key:"entityid",                 label:"Entity ID",                   required:true, span:2 },
+                          { key:"test_url",                 label:"ACS / Test URL",              required:false, span:2 },
+                          { key:"application_hosting",      label:"Hosting (Cloud/On-Prem/Hybrid)", required:false },
+                          { key:"application_criticality",  label:"Application Criticality",     required:false },
+                          { key:"application_sensitive_data", label:"Sensitive Data?",           required:false },
+                          { key:"incommon_member",          label:"InCommon Member?",            required:false },
+                          { key:"enterprise_domain",        label:"Enterprise Domain",           required:false },
+                        ]
+                      },
+                      {
+                        title: "👤 Business Owner", cols: 2,
+                        fields: [
+                          { key:"application_business_owner_name",              label:"Business Owner Name",               required:false },
+                          { key:"application_business_owner_netid",             label:"Business Owner NetID",              required:false },
+                          { key:"application_business_owner_ppid",              label:"Business Owner PPID",               required:false },
+                          { key:"application_business_owner_department_number", label:"Department Number",                 required:false },
+                          { key:"application_business_owner_department_name",   label:"Department Name",                   required:false },
+                          { key:"department_email_address",                     label:"Department Email Address",          required:false },
+                        ]
+                      },
+                      {
+                        title: "🔧 Technical Owner", cols: 2,
+                        fields: [
+                          { key:"application_technical_owner_name",   label:"Technical Owner Name",            required:false },
+                          { key:"application_technical_owner_netid",  label:"Technical Owner NetID",           required:false },
+                          { key:"application_technical_owner_ppid",   label:"Technical Owner PPID",            required:false },
+                        ]
+                      },
+                      {
+                        title: "🏢 Vendor", cols: 2,
+                        fields: [
+                          { key:"vendor",                       label:"Vendor / Company",                required:false },
+                          { key:"vendor_contact_name",          label:"Vendor Contact Name",             required:false },
+                          { key:"vendor_contact_email_address", label:"Vendor Contact Email",            required:false },
+                        ]
+                      },
+                      {
+                        title: "🛡️ Security", cols: 2,
+                        fields: [
+                          { key:"application_had_security_review",          label:"Security Review Completed?",  required:false },
+                          { key:"application_security_review_documentation", label:"Security Review Doc / REQ#", required:false },
+                        ]
+                      },
+                      {
+                        title: "🔐 Authentication & Authorization", cols: 2,
+                        fields: [
+                          { key:"enterprise_authentication",      label:"Enterprise Authentication",      required:false },
+                          { key:"authentication_protocol",        label:"Auth Protocol (SAML 2.0 / OIDC)", required:true },
+                          { key:"application_primary_identifier", label:"Primary Identifier",             required:true },
+                          { key:"non_ppid_justification",         label:"Non-PPID Justification",         required:false },
+                          { key:"authorization_method",           label:"Authorization Method",           required:false, span:2 },
+                        ]
+                      },
+                      {
+                        title: "👥 Audience", cols: 3,
+                        fields: [
+                          { key:"is_audience_euv_staff",     label:"EUV Staff",                required:false, checkbox:true },
+                          { key:"is_audience_euv_faculty",   label:"EUV Faculty",              required:false, checkbox:true },
+                          { key:"is_audience_euv_students",  label:"EUV Students",             required:false, checkbox:true },
+                          { key:"is_audience_euv_sponsored", label:"EUV Sponsored",            required:false, checkbox:true },
+                          { key:"is_audience_ehc_staff",     label:"EHC Staff",                required:false, checkbox:true },
+                          { key:"is_audience_ehc_sponsored", label:"EHC Sponsored",            required:false, checkbox:true },
+                        ]
+                      },
+                      {
+                        title: "📋 Attributes & Notes", cols: 1,
+                        fields: [
+                          { key:"attributes_released",   label:"Attributes Released",  required:true,  multiline:true, minHeight:100, placeholder:"givenName - legal first name\nsn - last name\nmail - email address" },
+                          { key:"implementation_notes",  label:"Implementation Notes", required:false, multiline:true, minHeight:60 },
+                        ]
+                      },
                     ];
 
-                    const filled = SSOIN_FIELDS.filter(f => f.required && ssoin[f.key]?.trim()).length;
-                    const reqCount = SSOIN_FIELDS.filter(f => f.required).length;
-                    const ready = filled === reqCount;
+                    const allRequired = SSOIN_SECTIONS.flatMap(s => s.fields).filter(f => f.required);
+                    const filled   = allRequired.filter(f => ssoin[f.key]?.trim()).length;
+                    const reqCount = allRequired.length;
+                    const ready    = filled === reqCount;
+
+                    // Field renderer — shared between input/checkbox/textarea
+                    const SsoinField = ({ f }) => {
+                      const val = ssoin[f.key];
+                      const hasVal = f.checkbox ? val === "true" : !!val?.trim();
+                      const borderCol = hasVal ? "#2563eb44" : "#2a2d3e";
+                      if (f.checkbox) {
+                        const checked = val === "true";
+                        return (
+                          <div key={f.key} style={{ display:"flex", alignItems:"center", gap:8, padding:"7px 10px",
+                            background:checked?"rgba(96,165,250,.08)":"#0f1117",
+                            border:`1px solid ${checked?"#60a5fa44":"#2a2d3e"}`, borderRadius:6, cursor:"pointer" }}
+                            onClick={() => patchSsoin({ [f.key]: checked ? "" : "true" })}>
+                            <div style={{ width:14, height:14, borderRadius:3, border:`2px solid ${checked?"#60a5fa":"#3a3d52"}`,
+                              background:checked?"#60a5fa":"transparent", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                              {checked && <span style={{ color:"white", fontSize:10, fontWeight:700 }}>✓</span>}
+                            </div>
+                            <span style={{ fontSize:12, color:checked?"#93c5fd":"#64748b" }}>{f.label}</span>
+                          </div>
+                        );
+                      }
+                      if (f.multiline) {
+                        return (
+                          <div key={f.key}>
+                            <div style={{ fontSize:11, color:f.required?"#94a3b8":"#475569", marginBottom:3 }}>
+                              {f.label}{f.required && <span style={{ color:"#f87171" }}> *</span>}
+                            </div>
+                            <textarea value={val || ""} onChange={e => patchSsoin({ [f.key]: e.target.value })}
+                              placeholder={f.placeholder || ""}
+                              style={{ width:"100%", minHeight:f.minHeight||60, background:"#0f1117",
+                                border:`1px solid ${borderCol}`, borderRadius:6, padding:"8px 10px",
+                                color:"#cbd5e1", fontSize:12, lineHeight:1.6, resize:"vertical", outline:"none" }} />
+                          </div>
+                        );
+                      }
+                      return (
+                        <div key={f.key} style={{ gridColumn: f.span === 2 ? "1/-1" : undefined }}>
+                          <div style={{ fontSize:11, color:f.required?"#94a3b8":"#475569", marginBottom:3 }}>
+                            {f.label}{f.required && <span style={{ color:"#f87171" }}> *</span>}
+                          </div>
+                          <input value={val || ""} onChange={e => patchSsoin({ [f.key]: e.target.value })}
+                            placeholder={f.placeholder || ""}
+                            style={{ width:"100%", background:"#0f1117", border:`1px solid ${borderCol}`,
+                              borderRadius:6, padding:"6px 10px", color:"#cbd5e1", fontSize:12, outline:"none", boxSizing:"border-box" }} />
+                        </div>
+                      );
+                    };
 
                     return (
                       <div style={{ gridColumn:"1/-1", background:"#141720", borderRadius:10, border:"1px solid rgba(139,92,246,.35)", padding:18 }}>
+                        {/* Header */}
                         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
                           <h3 style={{ margin:0, color:"#e2e8f0", fontSize:14, fontWeight:600 }}>🤝 Hand off to Gerry (GHALL4)</h3>
                           <div style={{ display:"flex", alignItems:"center", gap:8 }}>
@@ -1873,13 +2063,12 @@ mail - email address"
                               </button>
                             )}
                             <span style={{ fontSize:11, fontFamily:"monospace", color:ready?"#10b981":"#475569" }}>
-                              {filled}/{reqCount} required fields filled {ready?"✓":""}
+                              {filled}/{reqCount} required filled {ready?"✓":""}
                             </span>
                           </div>
                         </div>
                         <p style={{ margin:"0 0 14px", color:"#475569", fontSize:12 }}>
-                          Fill in the SSOIN fields below, then generate the handoff message for Gerry to implement.
-                          Fields marked <span style={{ color:"#f87171" }}>*</span> are required.
+                          Fields auto-populate from form analysis, comments, and Q&A responses. Fields marked <span style={{ color:"#f87171" }}>*</span> are required.
                         </p>
 
                         {ssoin.metadata_file && (
@@ -1890,39 +2079,31 @@ mail - email address"
                           </div>
                         )}
 
-                        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
-                          {SSOIN_FIELDS.filter(f => !f.multiline).map(f => (
-                            <div key={f.key}>
-                              <div style={{ fontSize:11, color: f.required?"#94a3b8":"#475569", marginBottom:3 }}>
-                                {f.label}{f.required && <span style={{ color:"#f87171" }}> *</span>}
+                        {/* Sectioned fields */}
+                        {SSOIN_SECTIONS.map(section => (
+                          <div key={section.title} style={{ marginBottom:16 }}>
+                            <div style={{ fontSize:11, fontWeight:700, color:"#334155", textTransform:"uppercase", letterSpacing:.5, marginBottom:8, paddingBottom:4, borderBottom:"1px solid #1a1e2e" }}>
+                              {section.title}
+                            </div>
+                            {section.fields[0]?.checkbox ? (
+                              <div style={{ display:"grid", gridTemplateColumns:`repeat(${section.cols},1fr)`, gap:6 }}>
+                                {section.fields.map(f => <SsoinField key={f.key} f={f} />)}
                               </div>
-                              <input
-                                value={ssoin[f.key] || ""}
-                                onChange={e => patchSsoin({ [f.key]: e.target.value })}
-                                placeholder={f.placeholder || ""}
-                                style={{ width:"100%", background:"#0f1117", border:`1px solid ${ssoin[f.key]?.trim() ? "#2563eb44" : "#2a2d3e"}`, borderRadius:6, padding:"6px 10px", color:"#cbd5e1", fontSize:12, outline:"none", boxSizing:"border-box" }}
-                              />
-                            </div>
-                          ))}
-                        </div>
-
-                        {SSOIN_FIELDS.filter(f => f.multiline).map(f => (
-                          <div key={f.key} style={{ marginBottom:10 }}>
-                            <div style={{ fontSize:11, color: f.required?"#94a3b8":"#475569", marginBottom:3 }}>
-                              {f.label}{f.required && <span style={{ color:"#f87171" }}> *</span>}
-                            </div>
-                            <textarea
-                              value={ssoin[f.key] || ""}
-                              onChange={e => patchSsoin({ [f.key]: e.target.value })}
-                              placeholder={f.placeholder || ""}
-                              style={{ width:"100%", minHeight: f.key==="attributes_released"?100:60, background:"#0f1117", border:`1px solid ${ssoin[f.key]?.trim()?"#2563eb44":"#2a2d3e"}`, borderRadius:6, padding:"8px 10px", color:"#cbd5e1", fontSize:12, lineHeight:1.6, resize:"vertical", outline:"none" }}
-                            />
+                            ) : section.fields[0]?.multiline ? (
+                              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+                                {section.fields.map(f => <SsoinField key={f.key} f={f} />)}
+                              </div>
+                            ) : (
+                              <div style={{ display:"grid", gridTemplateColumns:`repeat(${section.cols},1fr)`, gap:10 }}>
+                                {section.fields.map(f => <SsoinField key={f.key} f={f} />)}
+                              </div>
+                            )}
                           </div>
                         ))}
 
                         {sel.m.finalAttributes?.trim() && !ssoin.attributes_released?.trim() && (
                           <button onClick={() => patchSsoin({ attributes_released: sel.m.finalAttributes })}
-                            style={{ fontSize:11, padding:"4px 10px", border:"1px solid #2563eb44", borderRadius:5, background:"rgba(96,165,250,.08)", color:"#60a5fa", cursor:"pointer", marginBottom:12 }}>
+                            style={{ fontSize:11, padding:"4px 10px", border:"1px solid #2563eb44", borderRadius:5, background:"rgba(96,165,250,.08)", color:"#60a5fa", cursor:"pointer", marginBottom:14 }}>
                             ↑ Copy from Final Confirmed Attributes above
                           </button>
                         )}
