@@ -2533,52 +2533,51 @@ mail - email address"
                               s.is_audience_ehc_sponsored=== "true" && "EHC Sponsored",
                             ].filter(Boolean).join(", ");
 
+                            // 40 columns — exact order matching the Excel form (no PPID fields)
                             const cols = [
-                              ["ssoin_snow_request_item",                       s.snow_request_item                       || ""],
-                              ["ssoin_snow_task",                                s.snow_task                               || ""],
-                              ["ssoin_snow_request",                             s.snow_request                            || ""],
-                              ["ssoin_snow_incident",                            s.snow_incident                           || ""],
-                              ["ssoin_snow_archive_incident",                    s.snow_archive_incident                   || ""],
-                              ["ssoin_application_name",                         s.application_name                        || ""],
-                              ["ssoin_application_alternate_name",               s.application_alternate_name              || ""],
-                              ["ssoin_application_description",                  s.application_description                 || ""],
-                              ["ssoin_entityid",                                 s.entityid                                || ""],
-                              ["ssoin_test_url",                                 s.test_url                                || ""],
-                              ["ssoin_application_business_owner_name",          s.application_business_owner_name         || ""],
-                              ["ssoin_application_business_owner_netid",         s.application_business_owner_netid        || ""],
-                              ["ssoin_application_business_owner_ppid",          s.application_business_owner_ppid         || ""],
-                              ["ssoin_application_technical_owner_name",         s.application_technical_owner_name        || ""],
-                              ["ssoin_application_technical_owner_netid",        s.application_technical_owner_netid       || ""],
-                              ["ssoin_application_technical_owner_ppid",         s.application_technical_owner_ppid        || ""],
-                              ["ssoin_application_business_owner_department_number", s.application_business_owner_department_number || ""],
-                              ["ssoin_application_business_owner_department_name",   s.application_business_owner_department_name  || ""],
-                              ["ssoin_department_email_address",                 s.department_email_address                || ""],
-                              ["ssoin_vendor",                                   s.vendor                                  || ""],
-                              ["ssoin_vendor_contact_name",                      s.vendor_contact_name                     || ""],
-                              ["ssoin_vendor_contact_email_address",             s.vendor_contact_email_address            || ""],
-                              ["ssoin_incommon_member",                          toBool(s.incommon_member)],
-                              ["ssoin_application_had_security_review",          toBool(s.application_had_security_review)],
-                              ["ssoin_application_security_review_documentation",s.application_security_review_documentation || ""],
-                              ["ssoin_application_hosting",                      s.application_hosting                     || ""],
-                              ["ssoin_application_criticality",                  s.application_criticality                 || ""],
-                              ["ssoin_application_sensitive_data",               s.application_sensitive_data ? toBool(s.application_sensitive_data) : ""],
-                              ["ssoin_enterprise_authentication",                s.enterprise_authentication               || ""],
-                              ["ssoin_authentication_protocol",                  (s.authentication_protocol || "").replace("SAML 2.0","SAML2").replace("SAML2.0","SAML2")],
-                              ["ssoin_is_audience_euv_staff",                    toBool(s.is_audience_euv_staff)],
-                              ["ssoin_is_audience_euv_faculty",                  toBool(s.is_audience_euv_faculty)],
-                              ["ssoin_is_audience_euv_students",                 toBool(s.is_audience_euv_students)],
-                              ["ssoin_is_audience_euv_sponsored",                toBool(s.is_audience_euv_sponsored)],
-                              ["ssoin_is_audience_ehc_staff",                    toBool(s.is_audience_ehc_staff)],
-                              ["ssoin_is_audience_ehc_sponsored",                toBool(s.is_audience_ehc_sponsored)],
-                              ["ssoin_application_primary_identifier",           s.application_primary_identifier          || ""],
-                              ["ssoin_non_ppid_justification",                   s.non_ppid_justification                  || ""],
-                              ["ssoin_authorization_method",                     s.authorization_method                    || ""],
-                              ["ssoin_attributes_released",                      s.attributes_released                     || ""],
-                              ["ssoin_enterprise_domain",                        s.enterprise_domain                       || ""],
-                              ["ssoin_implementation_notes",                     s.implementation_notes                    || ""],
+                              [s.snow_request_item                       || ""],  // 1  ssoin_snow_request_item
+                              [s.snow_task                               || ""],  // 2  ssoin_snow_task
+                              [s.snow_request                            || ""],  // 3  ssoin_snow_request
+                              [s.snow_incident                           || ""],  // 4  ssoin_snow_incident
+                              [s.snow_archive_incident                   || ""],  // 5  ssoin_snow_archive_incident
+                              [s.application_name                        || ""],  // 6  ssoin_application_name
+                              [s.application_alternate_name              || ""],  // 7  ssoin_application_alternate_name
+                              [s.application_description                 || ""],  // 8  ssoin_application_description
+                              [s.entityid                                || ""],  // 9  ssoin_entityid
+                              [s.test_url                                || ""],  // 10 ssoin_test_url
+                              [s.application_business_owner_name         || ""],  // 11 ssoin_application_business_owner_name
+                              [s.application_business_owner_netid        || ""],  // 12 ssoin_application_business_owner_netid
+                              [s.application_technical_owner_name        || ""],  // 13 ssoin_application_technical_owner_name
+                              [s.application_technical_owner_netid       || ""],  // 14 ssoin_application_technical_owner_netid
+                              [s.application_business_owner_department_number || ""],  // 15 ssoin_application_business_owner_department_number
+                              [s.application_business_owner_department_name  || ""],  // 16 ssoin_application_business_owner_department_name
+                              [s.department_email_address                || ""],  // 17 ssoin_department_email_address
+                              [s.vendor                                  || ""],  // 18 ssoin_vendor
+                              [s.vendor_contact_name                     || ""],  // 19 ssoin_vendor_contact_name
+                              [s.vendor_contact_email_address            || ""],  // 20 ssoin_vendor_contact_email_address
+                              [toBool(s.incommon_member)],                         // 21 ssoin_incommon_member
+                              [toBool(s.application_had_security_review)],         // 22 ssoin_application_had_security_review
+                              [s.application_security_review_documentation || ""], // 23 ssoin_application_security_review_documentation
+                              [s.application_hosting                     || ""],  // 24 ssoin_application_hosting
+                              [s.application_criticality                 || ""],  // 25 ssoin_application_criticality
+                              [s.application_sensitive_data ? toBool(s.application_sensitive_data) : ""],  // 26 ssoin_application_sensitive_data
+                              [s.enterprise_authentication               || ""],  // 27 ssoin_enterprise_authentication
+                              [(s.authentication_protocol || "").replace("SAML 2.0","SAML2").replace("SAML2.0","SAML2")],  // 28 ssoin_authentication_protocol
+                              [toBool(s.is_audience_euv_staff)],                   // 29 ssoin_is_audience_euv_staff
+                              [toBool(s.is_audience_euv_faculty)],                 // 30 ssoin_is_audience_euv_faculty
+                              [toBool(s.is_audience_euv_students)],                // 31 ssoin_is_audience_euv_students
+                              [toBool(s.is_audience_euv_sponsored)],               // 32 ssoin_is_audience_euv_sponsored
+                              [toBool(s.is_audience_ehc_staff)],                   // 33 ssoin_is_audience_ehc_staff
+                              [toBool(s.is_audience_ehc_sponsored)],               // 34 ssoin_is_audience_ehc_sponsored
+                              [s.application_primary_identifier          || ""],  // 35 ssoin_application_primary_identifier
+                              [s.non_ppid_justification                  || ""],  // 36 ssoin_non_ppid_justification
+                              [s.authorization_method                    || ""],  // 37 ssoin_authorization_method
+                              [s.attributes_released                     || ""],  // 38 ssoin_attributes_released
+                              [s.enterprise_domain                       || ""],  // 39 ssoin_enterprise_domain
+                              [s.implementation_notes                    || ""],  // 40 ssoin_implementation_notes
                             ];
 
-                            const tsv = cols.map(([, v]) => v.replace(/\t/g, " ").replace(/\n/g, " | ")).join("\t");
+                            const tsv = cols.map(([v]) => (v || "").replace(/\t/g, " ").replace(/\n/g, " | ")).join("\t");
                             navigator.clipboard.writeText(tsv);
                             setCopied("excel_copy");
                             setTimeout(() => setCopied(""), 2500);
