@@ -907,6 +907,9 @@ The form has these exact labeled fields — extract them precisely:
 - "How will authorization be handled for the application?"
 - "Has the application been through an OIT Security Review?"
 - Audience section: "University Staff?", "University Faculty?", "University Students?", "Emory Healthcare Staff?", "Emory Healthcare Sponsored Account Holders?", "University Sponsored Account Holders?"
+- "Is your organization an InCommon member?" or similar InCommon membership question
+- "Does the application handle sensitive data?" or similar sensitive data question
+- "Enterprise Authentication:" or authentication platform field if present
 - Attributes section under "List any attribute requests below:"
 
 Return ONLY a JSON object in a \`\`\`json block with this exact shape:
@@ -917,11 +920,21 @@ Return ONLY a JSON object in a \`\`\`json block with this exact shape:
   "attributes": ["array of attribute names from the Request for Attributes section"],
   "hasPPID": false,
   "supportsSAML": "Yes | No | Not specified",
+  "authProtocol": "SAML2 | OIDC | Not specified — output exactly SAML2 or OIDC, not SAML 2.0",
   "securityReview": "Completed | Not completed | Not specified — from Has the application been through an OIT Security Review field",
   "accessLimitation": "string — from How will authorization be handled field",
   "entityId": "string or empty — from entityID field",
   "testUrl": "string or empty — from Test URL field",
   "hosting": "string or empty — from Internally or externally hosted field",
+  "incommonMember": "TRUE | FALSE — whether the application/institution is an InCommon member. Look for InCommon question on form.",
+  "sensitivData": "TRUE | FALSE — whether the application handles sensitive data",
+  "enterpriseAuth": "string — e.g. Shibboleth IDP, Azure AD, Okta — from enterprise authentication field if present",
+  "audienceEuvStaff": "TRUE | FALSE",
+  "audienceEuvFaculty": "TRUE | FALSE",
+  "audienceEuvStudents": "TRUE | FALSE",
+  "audienceEuvSponsored": "TRUE | FALSE",
+  "audienceEhcStaff": "TRUE | FALSE",
+  "audienceEhcSponsored": "TRUE | FALSE",
   "flags": ["one string per issue"],
   "emoryContact": "string — ONLY the person's full name from the Emory Contact field (e.g. 'Dalong Wang')",
   "emoryContactNetId": "string — the NetID on the same row as the Emory Contact (e.g. 'DWANG30')",
@@ -991,7 +1004,31 @@ Flag rules:
 
     // Always overwrite from form (form is the authoritative source)
     overwrite("application_name",                  analysis.appName);
-    overwrite("application_description",           analysis.appDescription);
+    // Build an enriched description: raw form description + audience + access context
+    if (analysis.appDescription || analysis.appName) {
+      const audParts = [
+        (analysis.audienceEuvStaff === "TRUE"     || analysis.audience?.includes("University employees")) && "Emory University staff",
+        (analysis.audienceEuvFaculty === "TRUE"   || analysis.audience?.includes("University employees")) && "faculty",
+        (analysis.audienceEuvStudents === "TRUE"  || analysis.audience?.includes("University students"))  && "students",
+        (analysis.audienceEuvSponsored === "TRUE")                                                         && "sponsored accounts",
+        (analysis.audienceEhcStaff === "TRUE"     || analysis.audience?.includes("Healthcare employees")) && "Emory Healthcare staff",
+        (analysis.audienceEhcSponsored === "TRUE")                                                         && "Healthcare sponsored accounts",
+      ].filter(Boolean);
+      // Deduplicate: if both staff+faculty from University employees, collapse
+      const audStr = audParts.length > 0 ? audParts.join(", ") : "";
+      const hostStr = analysis.hosting ? ` The application is ${analysis.hosting.toLowerCase()}.` : "";
+      const accessStr = analysis.accessLimitation ? ` Access is controlled via: ${analysis.accessLimitation}.` : "";
+      const vendorStr = analysis.vendor ? ` Hosted/provided by ${analysis.vendor}.` : "";
+      const baseDesc = analysis.appDescription || analysis.appName || sel.desc;
+      const enriched = [
+        baseDesc,
+        audStr ? `Used by: ${audStr}.` : "",
+        hostStr,
+        accessStr,
+        vendorStr,
+      ].filter(Boolean).join(" ").trim();
+      overwrite("application_description", enriched);
+    }
     overwrite("entityid",                          analysis.entityId);
     overwrite("test_url",                          analysis.testUrl);
     overwrite("application_hosting",               analysis.hosting);
@@ -1005,22 +1042,42 @@ Flag rules:
     overwrite("authorization_method",              analysis.accessLimitation);
     if (analysis.attributes?.length)
       overwrite("attributes_released", analysis.attributes.join("\n"));
-    // Protocol — only set if not already specified
-    if (analysis.supportsSAML === "Yes")
-      set("authentication_protocol", "SAML 2.0");
-    // Identifier — PPID from form; don't overwrite if already set to something else
+    // Protocol — use exact value from form (SAML2 or OIDC), fallback to supportsSAML
+    if (analysis.authProtocol && analysis.authProtocol !== "Not specified")
+      overwrite("authentication_protocol", analysis.authProtocol);
+    else if (analysis.supportsSAML === "Yes")
+      set("authentication_protocol", "SAML2");
+    // Identifier — PPID from form
     if (analysis.hasPPID)
       set("application_primary_identifier", "SerialNumber (PPID)");
-    // Security review status
+    // Security review — use TRUE/FALSE
     if (analysis.securityReview === "Completed")
-      set("application_had_security_review", "true");
-    // Audience checkboxes from form analysis
-    if (analysis.audience?.includes("University employees")) {
-      set("is_audience_euv_staff",   "true");
-      set("is_audience_euv_faculty", "true");
+      overwrite("application_had_security_review", "TRUE");
+    else if (analysis.securityReview === "Not completed")
+      set("application_had_security_review", "FALSE");
+    // InCommon member
+    if (analysis.incommonMember)
+      overwrite("incommon_member", analysis.incommonMember);
+    // Sensitive data
+    if (analysis.sensitivData)
+      overwrite("application_sensitive_data", analysis.sensitivData);
+    // Enterprise authentication
+    if (analysis.enterpriseAuth)
+      set("enterprise_authentication", analysis.enterpriseAuth);
+    // Individual audience booleans (TRUE/FALSE) from new form fields
+    if (analysis.audienceEuvStaff)     overwrite("is_audience_euv_staff",     analysis.audienceEuvStaff);
+    if (analysis.audienceEuvFaculty)   overwrite("is_audience_euv_faculty",   analysis.audienceEuvFaculty);
+    if (analysis.audienceEuvStudents)  overwrite("is_audience_euv_students",  analysis.audienceEuvStudents);
+    if (analysis.audienceEuvSponsored) overwrite("is_audience_euv_sponsored", analysis.audienceEuvSponsored);
+    if (analysis.audienceEhcStaff)     overwrite("is_audience_ehc_staff",     analysis.audienceEhcStaff);
+    if (analysis.audienceEhcSponsored) overwrite("is_audience_ehc_sponsored", analysis.audienceEhcSponsored);
+    // Fallback: legacy audience array -> TRUE/FALSE
+    if (!analysis.audienceEuvStaff && analysis.audience?.includes("University employees")) {
+      set("is_audience_euv_staff",   "TRUE");
+      set("is_audience_euv_faculty", "TRUE");
     }
-    if (analysis.audience?.includes("University students"))  set("is_audience_euv_students",  "true");
-    if (analysis.audience?.includes("Healthcare employees")) set("is_audience_ehc_staff",      "true");
+    if (!analysis.audienceEuvStudents  && analysis.audience?.includes("University students"))  set("is_audience_euv_students",  "TRUE");
+    if (!analysis.audienceEhcStaff     && analysis.audience?.includes("Healthcare employees")) set("is_audience_ehc_staff",      "TRUE");
     // Pre-fill ServiceNow ticket references from the ticket itself
     if (!existing.snow_task && num.startsWith("SCTASK")) set("snow_task",    num);
     if (!existing.snow_incident && num.startsWith("INC")) set("snow_incident", num);
@@ -2326,12 +2383,12 @@ mail - email address"
                       const hasVal = f.checkbox ? val === "true" : !!val?.trim();
                       const borderCol = hasVal ? "#2563eb44" : "#2a2d3e";
                       if (f.checkbox) {
-                        const checked = val === "true";
+                        const checked = val === "true" || val === "TRUE";
                         return (
                           <div key={f.key} style={{ display:"flex", alignItems:"center", gap:8, padding:"7px 10px",
                             background:checked?"rgba(96,165,250,.08)":"#0f1117",
                             border:`1px solid ${checked?"#60a5fa44":"#2a2d3e"}`, borderRadius:6, cursor:"pointer" }}
-                            onClick={() => { patch(sel.number, { ssoin: { ...sel.m.ssoin, [f.key]: checked ? "" : "true" } }); }}>
+                            onClick={() => { patch(sel.number, { ssoin: { ...sel.m.ssoin, [f.key]: checked ? "FALSE" : "TRUE" } }); }}>
                             <div style={{ width:14, height:14, borderRadius:3, border:`2px solid ${checked?"#60a5fa":"#3a3d52"}`,
                               background:checked?"#60a5fa":"transparent", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
                               {checked && <span style={{ color:"white", fontSize:10, fontWeight:700 }}>✓</span>}
@@ -2382,11 +2439,18 @@ mail - email address"
                           <h3 style={{ margin:0, color:"#e2e8f0", fontSize:14, fontWeight:600 }}>🤝 Hand off to Gerry (GHALL4)</h3>
                           <div style={{ display:"flex", alignItems:"center", gap:8 }}>
                             {sel.m.formAnalysis && (
-                              <button onClick={() => autoPopulateHandoff(sel.number, sel.m.formAnalysis)}
-                                title="Re-reads all fields from the analyzed form and overwrites current handoff values"
-                                style={{ fontSize:11, padding:"3px 9px", border:"1px solid #f59e0b33", borderRadius:5, background:"rgba(245,158,11,.08)", color:"#f59e0b", cursor:"pointer" }}>
-                                🔄 Refresh from form
-                              </button>
+                              <>
+                                <button onClick={() => autoPopulateHandoff(sel.number, sel.m.formAnalysis)}
+                                  title="Re-apply all extractable fields from the already-analyzed form into the handoff section"
+                                  style={{ fontSize:11, padding:"3px 9px", border:"1px solid #f59e0b33", borderRadius:5, background:"rgba(245,158,11,.08)", color:"#f59e0b", cursor:"pointer" }}>
+                                  🔄 Refresh from form
+                                </button>
+                                <button onClick={() => setTab("form")}
+                                  title="Go to Form Analysis tab to re-upload and re-analyze the form — picks up new fields like InCommon, audience booleans, and enterprise auth"
+                                  style={{ fontSize:11, padding:"3px 9px", border:"1px solid #60a5fa33", borderRadius:5, background:"rgba(96,165,250,.08)", color:"#60a5fa", cursor:"pointer" }}>
+                                  📄 Re-analyze form
+                                </button>
+                              </>
                             )}
                             <span style={{ fontSize:11, fontFamily:"monospace", color:ready?"#10b981":"#475569" }}>
                               {filled}/{reqCount} required filled {ready?"✓":""}
@@ -2448,6 +2512,8 @@ mail - email address"
                             // Build a two-row TSV: header row + value row, matching the ssoin_ field order
                             // This pastes directly into Excel with fields as columns
                             const s = ssoin;
+                            // Boolean converter: stored as "true"/"TRUE"/"Yes" -> "TRUE", else "FALSE"
+                            const toBool = (v) => (v === "true" || v === "TRUE" || v === "Yes" || v === "yes") ? "TRUE" : "FALSE";
                             const audience = [
                               s.is_audience_euv_staff    === "true" && "EUV Staff",
                               s.is_audience_euv_faculty  === "true" && "EUV Faculty",
@@ -2480,20 +2546,20 @@ mail - email address"
                               ["ssoin_vendor",                                   s.vendor                                  || ""],
                               ["ssoin_vendor_contact_name",                      s.vendor_contact_name                     || ""],
                               ["ssoin_vendor_contact_email_address",             s.vendor_contact_email_address            || ""],
-                              ["ssoin_incommon_member",                          s.incommon_member                         || ""],
-                              ["ssoin_application_had_security_review",          s.application_had_security_review === "true" ? "Yes" : (s.application_had_security_review || "")],
+                              ["ssoin_incommon_member",                          toBool(s.incommon_member)],
+                              ["ssoin_application_had_security_review",          toBool(s.application_had_security_review)],
                               ["ssoin_application_security_review_documentation",s.application_security_review_documentation || ""],
                               ["ssoin_application_hosting",                      s.application_hosting                     || ""],
                               ["ssoin_application_criticality",                  s.application_criticality                 || ""],
-                              ["ssoin_application_sensitive_data",               s.application_sensitive_data              || ""],
+                              ["ssoin_application_sensitive_data",               s.application_sensitive_data ? toBool(s.application_sensitive_data) : ""],
                               ["ssoin_enterprise_authentication",                s.enterprise_authentication               || ""],
-                              ["ssoin_authentication_protocol",                  s.authentication_protocol                 || ""],
-                              ["ssoin_is_audience_euv_staff",                    s.is_audience_euv_staff    === "true" ? "Yes" : ""],
-                              ["ssoin_is_audience_euv_faculty",                  s.is_audience_euv_faculty  === "true" ? "Yes" : ""],
-                              ["ssoin_is_audience_euv_students",                 s.is_audience_euv_students === "true" ? "Yes" : ""],
-                              ["ssoin_is_audience_euv_sponsored",                s.is_audience_euv_sponsored=== "true" ? "Yes" : ""],
-                              ["ssoin_is_audience_ehc_staff",                    s.is_audience_ehc_staff    === "true" ? "Yes" : ""],
-                              ["ssoin_is_audience_ehc_sponsored",                s.is_audience_ehc_sponsored=== "true" ? "Yes" : ""],
+                              ["ssoin_authentication_protocol",                  (s.authentication_protocol || "").replace("SAML 2.0","SAML2").replace("SAML2.0","SAML2")],
+                              ["ssoin_is_audience_euv_staff",                    toBool(s.is_audience_euv_staff)],
+                              ["ssoin_is_audience_euv_faculty",                  toBool(s.is_audience_euv_faculty)],
+                              ["ssoin_is_audience_euv_students",                 toBool(s.is_audience_euv_students)],
+                              ["ssoin_is_audience_euv_sponsored",                toBool(s.is_audience_euv_sponsored)],
+                              ["ssoin_is_audience_ehc_staff",                    toBool(s.is_audience_ehc_staff)],
+                              ["ssoin_is_audience_ehc_sponsored",                toBool(s.is_audience_ehc_sponsored)],
                               ["ssoin_application_primary_identifier",           s.application_primary_identifier          || ""],
                               ["ssoin_non_ppid_justification",                   s.non_ppid_justification                  || ""],
                               ["ssoin_authorization_method",                     s.authorization_method                    || ""],
@@ -2502,9 +2568,7 @@ mail - email address"
                               ["ssoin_implementation_notes",                     s.implementation_notes                    || ""],
                             ];
 
-                            const headers = cols.map(([h]) => h).join("\t");
-                            const values  = cols.map(([, v]) => v.replace(/\t/g, " ").replace(/\n/g, " | ")).join("\t");
-                            const tsv = headers + "\n" + values;
+                            const tsv = cols.map(([, v]) => v.replace(/\t/g, " ").replace(/\n/g, " | ")).join("\t");
                             navigator.clipboard.writeText(tsv);
                             setCopied("excel_copy");
                             setTimeout(() => setCopied(""), 2500);
