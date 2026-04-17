@@ -2108,14 +2108,95 @@ mail - email address"
                           </button>
                         )}
 
-                        <button className="abtn" onClick={() => genDraft("gerry_handoff")}
-                          style={{ display:"flex", alignItems:"center", gap:8, padding:"10px 18px", border:"1px solid rgba(139,92,246,.4)", borderRadius:8, background:"rgba(139,92,246,.1)", cursor:"pointer", transition:"all .15s" }}>
-                          <span style={{ fontSize:16 }}>🤝</span>
-                          <div>
-                            <div style={{ color:"#a78bfa", fontSize:13, fontWeight:600 }}>Generate Gerry Handoff Message</div>
-                            <div style={{ color:"#334155", fontSize:11 }}>Attributes approved — ready for implementation</div>
-                          </div>
-                        </button>
+                        <div style={{ display:"flex", gap:10, alignItems:"stretch", flexWrap:"wrap" }}>
+                          <button className="abtn" onClick={() => genDraft("gerry_handoff")}
+                            style={{ display:"flex", alignItems:"center", gap:8, padding:"10px 18px", border:"1px solid rgba(139,92,246,.4)", borderRadius:8, background:"rgba(139,92,246,.1)", cursor:"pointer", transition:"all .15s" }}>
+                            <span style={{ fontSize:16 }}>🤝</span>
+                            <div>
+                              <div style={{ color:"#a78bfa", fontSize:13, fontWeight:600 }}>Generate Gerry Handoff Message</div>
+                              <div style={{ color:"#334155", fontSize:11 }}>Attributes approved — ready for implementation</div>
+                            </div>
+                          </button>
+
+                          <button className="abtn" onClick={() => {
+                            // Build a two-row TSV: header row + value row, matching the ssoin_ field order
+                            // This pastes directly into Excel with fields as columns
+                            const s = ssoin;
+                            const audience = [
+                              s.is_audience_euv_staff    === "true" && "EUV Staff",
+                              s.is_audience_euv_faculty  === "true" && "EUV Faculty",
+                              s.is_audience_euv_students === "true" && "EUV Students",
+                              s.is_audience_euv_sponsored=== "true" && "EUV Sponsored",
+                              s.is_audience_ehc_staff    === "true" && "EHC Staff",
+                              s.is_audience_ehc_sponsored=== "true" && "EHC Sponsored",
+                            ].filter(Boolean).join(", ");
+
+                            const cols = [
+                              ["ssoin_snow_request_item",                       s.snow_request_item                       || ""],
+                              ["ssoin_snow_task",                                s.snow_task                               || ""],
+                              ["ssoin_snow_request",                             s.snow_request                            || ""],
+                              ["ssoin_snow_incident",                            s.snow_incident                           || ""],
+                              ["ssoin_snow_archive_incident",                    s.snow_archive_incident                   || ""],
+                              ["ssoin_application_name",                         s.application_name                        || ""],
+                              ["ssoin_application_alternate_name",               s.application_alternate_name              || ""],
+                              ["ssoin_application_description",                  s.application_description                 || ""],
+                              ["ssoin_entityid",                                 s.entityid                                || ""],
+                              ["ssoin_test_url",                                 s.test_url                                || ""],
+                              ["ssoin_application_business_owner_name",          s.application_business_owner_name         || ""],
+                              ["ssoin_application_business_owner_netid",         s.application_business_owner_netid        || ""],
+                              ["ssoin_application_business_owner_ppid",          s.application_business_owner_ppid         || ""],
+                              ["ssoin_application_technical_owner_name",         s.application_technical_owner_name        || ""],
+                              ["ssoin_application_technical_owner_netid",        s.application_technical_owner_netid       || ""],
+                              ["ssoin_application_technical_owner_ppid",         s.application_technical_owner_ppid        || ""],
+                              ["ssoin_application_business_owner_department_number", s.application_business_owner_department_number || ""],
+                              ["ssoin_application_business_owner_department_name",   s.application_business_owner_department_name  || ""],
+                              ["ssoin_department_email_address",                 s.department_email_address                || ""],
+                              ["ssoin_vendor",                                   s.vendor                                  || ""],
+                              ["ssoin_vendor_contact_name",                      s.vendor_contact_name                     || ""],
+                              ["ssoin_vendor_contact_email_address",             s.vendor_contact_email_address            || ""],
+                              ["ssoin_incommon_member",                          s.incommon_member                         || ""],
+                              ["ssoin_application_had_security_review",          s.application_had_security_review === "true" ? "Yes" : (s.application_had_security_review || "")],
+                              ["ssoin_application_security_review_documentation",s.application_security_review_documentation || ""],
+                              ["ssoin_application_hosting",                      s.application_hosting                     || ""],
+                              ["ssoin_application_criticality",                  s.application_criticality                 || ""],
+                              ["ssoin_application_sensitive_data",               s.application_sensitive_data              || ""],
+                              ["ssoin_enterprise_authentication",                s.enterprise_authentication               || ""],
+                              ["ssoin_authentication_protocol",                  s.authentication_protocol                 || ""],
+                              ["ssoin_is_audience_euv_staff",                    s.is_audience_euv_staff    === "true" ? "Yes" : ""],
+                              ["ssoin_is_audience_euv_faculty",                  s.is_audience_euv_faculty  === "true" ? "Yes" : ""],
+                              ["ssoin_is_audience_euv_students",                 s.is_audience_euv_students === "true" ? "Yes" : ""],
+                              ["ssoin_is_audience_euv_sponsored",                s.is_audience_euv_sponsored=== "true" ? "Yes" : ""],
+                              ["ssoin_is_audience_ehc_staff",                    s.is_audience_ehc_staff    === "true" ? "Yes" : ""],
+                              ["ssoin_is_audience_ehc_sponsored",                s.is_audience_ehc_sponsored=== "true" ? "Yes" : ""],
+                              ["ssoin_application_primary_identifier",           s.application_primary_identifier          || ""],
+                              ["ssoin_non_ppid_justification",                   s.non_ppid_justification                  || ""],
+                              ["ssoin_authorization_method",                     s.authorization_method                    || ""],
+                              ["ssoin_attributes_released",                      s.attributes_released                     || ""],
+                              ["ssoin_enterprise_domain",                        s.enterprise_domain                       || ""],
+                              ["ssoin_implementation_notes",                     s.implementation_notes                    || ""],
+                            ];
+
+                            const headers = cols.map(([h]) => h).join("\t");
+                            const values  = cols.map(([, v]) => v.replace(/\t/g, " ").replace(/\n/g, " | ")).join("\t");
+                            const tsv = headers + "\n" + values;
+                            navigator.clipboard.writeText(tsv);
+                            setCopied("excel_copy");
+                            setTimeout(() => setCopied(""), 2500);
+                          }}
+                            style={{ display:"flex", alignItems:"center", gap:8, padding:"10px 18px",
+                              border:`1px solid ${copied==="excel_copy" ? "#10b981" : "rgba(16,185,129,.35)"}`,
+                              borderRadius:8,
+                              background:copied==="excel_copy" ? "rgba(16,185,129,.25)" : "rgba(16,185,129,.08)",
+                              cursor:"pointer", transition:"all .2s" }}>
+                            <span style={{ fontSize:16 }}>{copied==="excel_copy" ? "✓" : "📋"}</span>
+                            <div>
+                              <div style={{ color:copied==="excel_copy" ? "#34d399" : "#34d399", fontSize:13, fontWeight:600 }}>
+                                {copied==="excel_copy" ? "Copied!" : "Copy to Excel"}
+                              </div>
+                              <div style={{ color:"#334155", fontSize:11 }}>All fields as tab-separated row</div>
+                            </div>
+                          </button>
+                        </div>
                       </div>
                     );
                   })()}
